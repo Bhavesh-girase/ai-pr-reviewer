@@ -35,32 +35,15 @@ class RetrievalPipeline:
 
     def retrieve_documents(self, query: str):
         try:
-            bm25_docs = self.bm25.invoke(query)
-            bm25_ids = {doc.metadata.get("chunk_id") for doc in bm25_docs if "chunk_id" in doc.metadata}
-        except Exception:
-            bm25_ids = set()
+            hybrid_docs = self.hybrid_retriever.invoke(query)
 
-        try:
-            vector_retriever = self.vectorstore.as_retriever(search_kwargs={"k": TOP_K})
-            vector_docs = vector_retriever.invoke(query)
-            vector_ids = {doc.metadata.get("chunk_id") for doc in vector_docs if "chunk_id" in doc.metadata}
-        except Exception:
-            vector_ids = set()
-
-        hybrid_docs = self.hybrid_retriever.invoke(query)
-
-        for doc in hybrid_docs:
-            chunk_id = doc.metadata.get("chunk_id")
-            if chunk_id in bm25_ids and chunk_id in vector_ids:
+            for doc in hybrid_docs:
                 doc.metadata["retrieval_source"] = "Hybrid (BM25 + Vector)"
-            elif chunk_id in bm25_ids:
-                doc.metadata["retrieval_source"] = "BM25 (Keyword)"
-            elif chunk_id in vector_ids:
-                doc.metadata["retrieval_source"] = "Vector (Semantic)"
-            else:
-                doc.metadata["retrieval_source"] = "Hybrid (Ensemble)"
 
-        return hybrid_docs
+            return hybrid_docs
+        except Exception:
+            return []
+
 
     def rerank_documents(self, query: str, documents):
         if not documents:
