@@ -15,6 +15,13 @@ import test_pull_requests as t_pr
 import test_insights as t_ins
 import test_repository_sync as t_sync
 import test_webhooks as t_wh
+import test_legacy_routes_removal as t_legacy
+import test_audit5_hardening as t_audit5
+import test_audit6_fixes as t_audit6
+import test_audit7_l1_fix as t_audit7
+import test_audit8_l1_fix as t_audit8
+import test_audit11_fixes as t_audit11
+import test_audit12_fixes as t_audit12
 
 test_modules = [
     ("GitHub Integration", t_gh),
@@ -23,6 +30,13 @@ test_modules = [
     ("Insights", t_ins),
     ("Repository Sync", t_sync),
     ("Webhooks", t_wh),
+    ("Legacy Routes Removal", t_legacy),
+    ("Audit 5 Hardening", t_audit5),
+    ("Audit 6 Fixes", t_audit6),
+    ("Audit 7 L-1 Fix", t_audit7),
+    ("Audit 8 L-1 Fix", t_audit8),
+    ("Audit 11 Fixes", t_audit11),
+    ("Audit 12 Fixes", t_audit12),
 ]
 
 def run_module_tests(mod_name, mod):

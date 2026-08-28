@@ -129,6 +129,7 @@ def test_repository_sync_failure_preserves_old_commit(mock_project_data):
         mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [mock_project_data]
 
         mock_repo = setup_mock_git_repo("commit_aaa_111", "commit_bbb_222")
+        mock_repo.git.fetch.side_effect = Exception("Git network timeout")
         mock_repo.remotes.origin.fetch.side_effect = Exception("Git network timeout")
 
         with patch("src.services.repository_sync_service.get_supabase_client", return_value=mock_supabase), \

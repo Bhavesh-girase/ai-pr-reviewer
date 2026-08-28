@@ -5,6 +5,7 @@ from fastapi import HTTPException, status
 
 from src.api.auth import get_supabase_client
 from src.github.github_client import GitHubClient
+from src.utils.security import encryption_service
 from src.services.project_service import project_service
 from src.services.github_credentials_service import github_credentials_service
 from src.pr_reviewer import PRReviewer
@@ -45,7 +46,7 @@ class PullRequestService:
 
         token = None
         if auth_type == "custom_token" and custom_token:
-            token = custom_token.strip()
+            token = encryption_service.decrypt_or_passthrough(custom_token.strip())
         else:
             token = github_credentials_service.get_decrypted_pat(user_id, user_token)
 

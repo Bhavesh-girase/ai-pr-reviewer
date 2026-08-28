@@ -23,6 +23,7 @@ class PRReviewer:
     """
 
     def __init__(self, github_token: str | None = None):
+        self.github_token = github_token
         self.github = GitHubClient(github_token)
         self.index_manager = IndexManager()
 
@@ -32,13 +33,14 @@ class PRReviewer:
         owner: str,
         repository: str,
         pull_number: int,
+        local_path: Path | None = None,
     ):
         start_time = time.time()
         # --------------------------------------------------
         # Step 1 : Clone / Update repository
         # --------------------------------------------------
 
-        repository_path = prepare_repository(repo_url)
+        repository_path = prepare_repository(repo_url, local_path=local_path, token=self.github_token)
         repository_name = Path(repository_path).name
 
         # --------------------------------------------------
@@ -74,7 +76,10 @@ class PRReviewer:
         
         # Ensure we have the PR commits locally
         try:
-            repo.remotes.origin.fetch(f"pull/{pull_number}/head")
+            if self.github_token:
+                repo.git.fetch("origin", f"pull/{pull_number}/head", c=f"http.extraHeader=Authorization: Bearer {self.github_token}")
+            else:
+                repo.remotes.origin.fetch(f"pull/{pull_number}/head")
         except Exception as e:
             print(f"Warning: Failed to fetch PR commits: {e}")
 

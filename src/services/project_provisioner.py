@@ -4,6 +4,7 @@ from pathlib import Path
 from git import Repo
 from langchain_chroma import Chroma
 from src.config import embedding_function
+from src.utils.security import encryption_service, sanitize_error_message
 from src.github.repository_loader import load_repository
 from src.ingestion.code_chunker import chunk_documents
 from src.github.repository_manager import clone_repository
@@ -16,7 +17,7 @@ class ProjectProvisioner:
     """
     Handles physical workspace provisioning for a Project:
     1. Storage allocation
-    2. Git clone with token authentication
+    2. Git clone with token authentication (without storing credentials in .git/config)
     3. Codebase loading & vector indexing into ChromaDB
     4. HEAD commit hash inspection
     5. Cleanup rollback on failure
@@ -45,7 +46,7 @@ class ProjectProvisioner:
             # Step 2: Resolve GitHub Token
             token = None
             if auth_type == "custom_token" and custom_token:
-                token = custom_token.strip()
+                token = encryption_service.decrypt_or_passthrough(custom_token.strip())
             else:
                 token = github_credentials_service.get_decrypted_pat(user_id, user_token)
 
@@ -55,12 +56,12 @@ class ProjectProvisioner:
             # Step 3: Update Status -> CLONING
             update_status_fn(project_id, "CLONING")
 
-            # Format authenticated git URL
-            clone_url = f"https://x-access-token:{token}@github.com/{owner}/{repo}.git"
+            # Clean HTTPS clone URL without credentials
+            clone_url = f"https://github.com/{owner}/{repo}.git"
 
-            # Clone repository
+            # Clone repository with ephemeral auth header
             logger.info(f"Cloning repository {owner}/{repo} into {repo_dir}")
-            clone_repository(clone_url, repo_dir)
+            clone_repository(clone_url, repo_dir, token=token)
 
             # Step 4: Update Status -> INDEXING
             update_status_fn(project_id, "INDEXING")
@@ -107,16 +108,17 @@ class ProjectProvisioner:
             return final_update
 
         except Exception as e:
-            err_msg = f"Provisioning failed for project {project_id}: {str(e)}"
-            logger.error(err_msg, exc_info=True)
+            sanitized_err = sanitize_error_message(str(e))
+            err_msg = f"Provisioning failed for project {project_id}: {sanitized_err}"
+            logger.error(err_msg, exc_info=False)
 
             # Rollback: Clean storage directories
             project_storage.cleanup_project_storage(user_id, project_id)
 
-            # Mark DB FAILED
+            # Mark DB FAILED with sanitized error
             failed_update = {
                 "status": "FAILED",
-                "error_message": str(e)
+                "error_message": sanitized_err
             }
             return failed_update
 

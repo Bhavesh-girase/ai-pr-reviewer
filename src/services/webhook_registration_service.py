@@ -42,7 +42,7 @@ class WebhookRegistrationService:
 
         token = None
         if auth_type == "custom_token" and custom_token:
-            token = custom_token.strip()
+            token = encryption_service.decrypt_or_passthrough(custom_token.strip())
         else:
             token = github_credentials_service.get_decrypted_pat(user_id, user_token)
 

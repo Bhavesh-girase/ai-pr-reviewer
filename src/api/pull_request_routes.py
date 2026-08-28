@@ -9,6 +9,7 @@ from src.schemas.pull_request import (
     PullRequestDiffSchema,
     PullRequestReviewRequestSchema,
 )
+from src.security.rate_limiter import review_rate_limiter
 from src.services.pull_request_service import pull_request_service
 
 logger = logging.getLogger(__name__)
@@ -100,10 +101,14 @@ async def review_pull_request(
     """
     Executes the existing AI Review Pipeline for the specified Project Pull Request.
     Does not require the user to provide a repository URL manually.
+    Rate limited per authenticated user prior to expensive RAG/LLM processing.
     """
+    user_id = current_user["id"]
+    review_rate_limiter.check_rate_limit(user_id)
+
     return await pull_request_service.review_pull_request(
         project_id=project_id,
         pr_number=pr_number,
-        user_id=current_user["id"],
+        user_id=user_id,
         user_token=current_user["token"],
     )

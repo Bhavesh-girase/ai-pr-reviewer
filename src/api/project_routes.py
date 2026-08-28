@@ -32,7 +32,7 @@ async def get_project(
     """
     Retrieves project details by UUID for the authenticated user.
     """
-    return project_service.get_project_by_id(project_id, current_user["id"], current_user["token"])
+    return project_service.get_project_by_id(project_id, current_user["id"], current_user["token"], sanitize=True)
 
 @router.post("", response_model=ProjectResponseSchema, status_code=status.HTTP_201_CREATED)
 async def create_project(

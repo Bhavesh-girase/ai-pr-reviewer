@@ -10,7 +10,7 @@ export interface Project {
   github_repository: string
   default_branch: string
   auth_type: AuthType
-  custom_token?: string
+  has_custom_token?: boolean
   clone_path?: string
   chroma_path?: string
   current_commit_hash?: string
@@ -35,7 +35,7 @@ export interface Project {
   repoName?: string
   defaultBranch?: string
   authType?: AuthType
-  customToken?: string
+  hasCustomToken?: boolean
   createdAt?: string
   lastSyncTime?: string
 }
@@ -66,7 +66,7 @@ export interface CreateProjectInput {
   project_name: string
   github_owner: string
   github_repository: string
-  default_branch: string
+  default_branch?: string
   auth_type: AuthType
   custom_token?: string
 }

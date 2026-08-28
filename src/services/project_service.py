@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 from fastapi import HTTPException, status
 from src.api.auth import get_supabase_client
 from src.github.github_client import GitHubClient
+from src.utils.security import encryption_service, sanitize_error_message
 from src.services.github_credentials_service import github_credentials_service
 from src.services.project_provisioner import project_provisioner
 from src.storage.project_storage import project_storage
@@ -36,10 +37,20 @@ class ProjectService:
                 detail=f"Database failure during {operation}: {err_msg}"
             )
 
+    def _format_project(self, project: Dict[str, Any], sanitize: bool = True) -> Dict[str, Any]:
+        if not project:
+            return project
+        data = dict(project)
+        data["has_custom_token"] = bool(data.get("custom_token"))
+        if sanitize:
+            data.pop("custom_token", None)
+            data.pop("webhook_secret_encrypted", None)
+        return data
+
     def _get_github_client_for_user(self, user_id: str, user_token: str, auth_type: str, custom_token: Optional[str]) -> GitHubClient:
         token = None
         if auth_type == "custom_token" and custom_token:
-            token = custom_token.strip()
+            token = encryption_service.decrypt_or_passthrough(custom_token.strip())
         else:
             token = github_credentials_service.get_decrypted_pat(user_id, user_token)
         return GitHubClient(token=token)
@@ -48,14 +59,14 @@ class ProjectService:
         try:
             supabase = get_supabase_client(user_token)
             res = supabase.table(self.TABLE_NAME).select("*").order("created_at", desc=True).execute()
-            return res.data or []
+            return [self._format_project(p, sanitize=True) for p in (res.data or [])]
         except HTTPException:
             raise
         except Exception as e:
             self._handle_db_error(e, "fetch user projects")
             return []
 
-    def get_project_by_id(self, project_id: str, user_id: str, user_token: str) -> Dict[str, Any]:
+    def get_project_by_id(self, project_id: str, user_id: str, user_token: str, sanitize: bool = False) -> Dict[str, Any]:
         try:
             supabase = get_supabase_client(user_token)
             res = supabase.table(self.TABLE_NAME).select("*").eq("id", project_id).execute()
@@ -64,7 +75,7 @@ class ProjectService:
                     status_code=status.HTTP_404_NOT_FOUND,
                     detail=f"Project with ID '{project_id}' not found."
                 )
-            return res.data[0]
+            return self._format_project(res.data[0], sanitize=sanitize)
         except HTTPException:
             raise
         except Exception as e:
@@ -89,6 +100,10 @@ class ProjectService:
             )
 
         # Step 2: Insert initial DB record with status = CREATING
+        encrypted_custom_token = None
+        if custom_token and custom_token.strip():
+            encrypted_custom_token = encryption_service.encrypt(custom_token.strip())
+
         db_payload = {
             "user_id": user_id,
             "project_name": input_data["project_name"].strip(),
@@ -96,7 +111,7 @@ class ProjectService:
             "github_repository": repo,
             "default_branch": default_branch,
             "auth_type": auth_type,
-            "custom_token": custom_token,
+            "custom_token": encrypted_custom_token,
             "status": "CREATING"
         }
 
@@ -134,19 +149,26 @@ class ProjectService:
         # Step 4: Update final status & paths in DB
         try:
             final_res = supabase.table(self.TABLE_NAME).update(provision_res).eq("id", project_id).execute()
-            return final_res.data[0] if final_res.data else project_record
+            saved = final_res.data[0] if final_res.data else project_record
+            return self._format_project(saved, sanitize=True)
         except Exception as e:
             self._handle_db_error(e, "update provisioned project state")
-            return project_record
+            return self._format_project(project_record, sanitize=True)
 
     async def update_project(self, project_id: str, user_id: str, user_token: str, update_data: dict) -> Dict[str, Any]:
-        existing = self.get_project_by_id(project_id, user_id, user_token)
+        existing = self.get_project_by_id(project_id, user_id, user_token, sanitize=False)
 
         new_owner = update_data.get("github_owner") or existing["github_owner"]
         new_repo = update_data.get("github_repository") or existing["github_repository"]
         repo_changed = (new_owner != existing["github_owner"] or new_repo != existing["github_repository"])
 
         payload = {k: v for k, v in update_data.items() if v is not None}
+        if "custom_token" in payload:
+            ct = payload["custom_token"]
+            if ct and str(ct).strip():
+                payload["custom_token"] = encryption_service.encrypt(str(ct).strip())
+            else:
+                payload["custom_token"] = None
 
         supabase = get_supabase_client(user_token)
         try:
@@ -154,7 +176,7 @@ class ProjectService:
             updated_record = res.data[0] if res.data else existing
         except Exception as e:
             self._handle_db_error(e, f"update project {project_id}")
-            return existing
+            return self._format_project(existing, sanitize=True)
 
         # If repo changed, re-provision workspace
         if repo_changed:
@@ -169,13 +191,14 @@ class ProjectService:
                 update_status
             )
             final_res = supabase.table(self.TABLE_NAME).update(provision_res).eq("id", project_id).execute()
-            return final_res.data[0] if final_res.data else updated_record
+            saved = final_res.data[0] if final_res.data else updated_record
+            return self._format_project(saved, sanitize=True)
 
-        return updated_record
+        return self._format_project(updated_record, sanitize=True)
 
     def delete_project(self, project_id: str, user_id: str, user_token: str) -> Dict[str, Any]:
         # Verify ownership first
-        self.get_project_by_id(project_id, user_id, user_token)
+        self.get_project_by_id(project_id, user_id, user_token, sanitize=False)
 
         supabase = get_supabase_client(user_token)
         try:

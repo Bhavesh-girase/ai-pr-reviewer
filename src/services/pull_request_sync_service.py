@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 from src.api.auth import get_supabase_client
 from src.github.github_client import GitHubClient
+from src.utils.security import encryption_service
 from src.services.github_credentials_service import github_credentials_service
 
 logger = logging.getLogger(__name__)
@@ -38,7 +39,7 @@ class PullRequestSyncService:
 
         token = None
         if auth_type == "custom_token" and custom_token:
-            token = custom_token.strip()
+            token = encryption_service.decrypt_or_passthrough(custom_token.strip())
         else:
             token = github_credentials_service.get_decrypted_pat(target_user_id, user_token)
 

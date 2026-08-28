@@ -1,5 +1,6 @@
 import logging
 import time
+from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
@@ -7,7 +8,8 @@ from fastapi import HTTPException, status
 from src.api.auth import get_supabase_client
 from src.pr_reviewer import PRReviewer
 from src.services.pull_request_sync_service import pull_request_sync_service
-from src.utils.security import encryption_service
+from src.storage.project_storage import project_storage
+from src.utils.security import encryption_service, sanitize_error_message
 
 logger = logging.getLogger("review_service")
 
@@ -45,9 +47,9 @@ class ReviewService:
             encrypted_token = project.get("custom_token")
             if encrypted_token:
                 try:
-                    token = encryption_service.decrypt(encrypted_token)
+                    token = encryption_service.decrypt_or_passthrough(encrypted_token)
                 except Exception as e:
-                    logger.error(f"Failed to decrypt custom token for project {project_id}: {e}")
+                    logger.error(f"Failed to decrypt custom token for project {project_id}: {sanitize_error_message(e)}")
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail="Failed to decrypt project credentials."
@@ -196,12 +198,16 @@ class ReviewService:
         # 3. Execute AI Review Pipeline
         start_time = time.time()
         try:
+            repo_dir, _ = project_storage.ensure_project_directories(user_id, project_id)
+            local_repo_path = Path(project.get("clone_path") or str(repo_dir))
+
             reviewer = PRReviewer(github_token=token)
             review_data = reviewer.review(
                 repo_url=repo_url,
                 owner=owner,
                 repository=repo,
-                pull_number=pr_number
+                pull_number=pr_number,
+                local_path=local_repo_path
             )
 
             # 4. Extract structured metadata & calculate severity metrics
@@ -218,33 +224,51 @@ class ReviewService:
 
                 for iss in file_review_dict.get("issues", []):
                     if hasattr(iss, "dict"):
-                        all_issues.append(iss.dict())
+                        iss_dict = iss.dict()
                     elif isinstance(iss, dict):
-                        all_issues.append(iss)
+                        iss_dict = iss
+                    else:
+                        continue
+                    all_issues.append(iss_dict)
 
+            critical_count = sum(1 for i in all_issues if i.get("severity") == "CRITICAL")
+            high_count = sum(1 for i in all_issues if i.get("severity") == "HIGH")
+            medium_count = sum(1 for i in all_issues if i.get("severity") == "MEDIUM")
+            low_count = sum(1 for i in all_issues if i.get("severity") == "LOW")
             issues_count = len(all_issues)
-            critical_count = sum(1 for i in all_issues if str(i.get("severity", "")).upper() == "CRITICAL")
-            high_count = sum(1 for i in all_issues if str(i.get("severity", "")).upper() == "HIGH")
-            medium_count = sum(1 for i in all_issues if str(i.get("severity", "")).upper() == "MEDIUM")
-            low_count = sum(1 for i in all_issues if str(i.get("severity", "")).upper() == "LOW")
             files_reviewed = len(reviews_list)
 
-            duration_sec = review_data.get("metadata", {}).get("duration", time.time() - start_time)
-            duration_ms = int(duration_sec * 1000)
+            # Calculate review duration
+            duration_ms = int((time.time() - start_time) * 1000)
 
-            # Extract overall summary
-            summary = ""
-            if reviews_list:
-                first_r = reviews_list[0].get("review", {})
-                if hasattr(first_r, "summary"):
-                    summary = first_r.summary
-                elif isinstance(first_r, dict):
-                    summary = first_r.get("summary", "")
+            # Summary generation fallback
+            summary = review_data.get("summary")
+            if not summary:
+                if reviews_list:
+                    first_r = reviews_list[0].get("review", {})
+                    if hasattr(first_r, "summary"):
+                        summary = first_r.summary
+                    elif isinstance(first_r, dict):
+                        summary = first_r.get("summary", "")
+            if not summary:
+                summary = (
+                    f"AI PR Review completed. Analyzed {files_reviewed} files with {issues_count} potential issues identified "
+                    f"({critical_count} critical, {high_count} high, {medium_count} medium, {low_count} low)."
+                )
 
-            # Ensure serializable review_result
+            base_sha = (
+                pr_record.get("base_sha")
+                or (pr_record.get("raw_data") or {}).get("base", {}).get("sha", "unknown")
+            )
+            head_sha = (
+                pr_record.get("head_sha")
+                or (pr_record.get("raw_data") or {}).get("head", {}).get("sha", "unknown")
+            )
+
+            # Clean serializable payload
             serializable_reviews = []
             for r in reviews_list:
-                f_rev = r.get("review", {})
+                f_rev = r.get("review")
                 if hasattr(f_rev, "dict"):
                     f_rev = f_rev.dict()
                 serializable_reviews.append({
@@ -311,9 +335,10 @@ class ReviewService:
             return res_item
 
         except Exception as e:
-            logger.error(f"AI review execution failed for Review {review_id}: {e}", exc_info=True)
+            sanitized_err = sanitize_error_message(str(e))
+            logger.error(f"AI review execution failed for Review {review_id}: {sanitized_err}", exc_info=False)
             now_failed = datetime.now(timezone.utc).isoformat()
-            safe_error = "Unable to complete AI analysis. " + str(e)
+            safe_error = "Unable to complete AI analysis. " + sanitized_err
             try:
                 supabase.table("reviews").update({
                     "status": "FAILED",

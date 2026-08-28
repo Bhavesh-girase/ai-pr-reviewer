@@ -4,6 +4,7 @@ from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from supabase import create_client, Client
 from src.config import SUPABASE_URL, SUPABASE_KEY
+from src.utils.security import sanitize_error_message
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +47,7 @@ async def get_current_user(
         if not user_response or not user_response.user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired access token"
+                detail="Invalid or expired access token."
             )
         
         user = user_response.user
@@ -59,8 +60,9 @@ async def get_current_user(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Authentication failed: {str(e)}")
+        sanitized_err = sanitize_error_message(str(e))
+        logger.error(f"Authentication verification failed: {sanitized_err}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Authentication failed: {str(e)}"
+            detail="Invalid or expired access token."
         )

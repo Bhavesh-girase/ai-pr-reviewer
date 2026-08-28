@@ -53,7 +53,7 @@ export default function ProjectModal({
       setRepoName(editingProject.github_repository || editingProject.repoName || '')
       setDefaultBranch(editingProject.default_branch || editingProject.defaultBranch || 'main')
       setAuthType(editingProject.auth_type || editingProject.authType || 'connected_account')
-      setCustomToken(editingProject.custom_token || editingProject.customToken || '')
+      setCustomToken('')
     } else {
       setName('')
       setRepoOwner('')
@@ -295,11 +295,11 @@ export default function ProjectModal({
           <div className="space-y-1.5 animate-fade-in pl-1">
             <label className="text-xs font-semibold text-zinc-300 flex items-center gap-1">
               <span>GitHub Token</span>
-              <span className="text-red-400">*</span>
+              {!editingProject && <span className="text-red-400">*</span>}
             </label>
             <input
               type="password"
-              placeholder="ghp_************************************"
+              placeholder={editingProject?.has_custom_token || editingProject?.hasCustomToken ? "•••••••••••••••• (Leave blank to keep existing token)" : "ghp_************************************"}
               value={customToken}
               onChange={(e) => {
                 setCustomToken(e.target.value)

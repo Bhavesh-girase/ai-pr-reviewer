@@ -16,20 +16,20 @@ class ProjectSyncStatusEnum(str, Enum):
     SYNC_FAILED = "SYNC_FAILED"
 
 class ProjectCreateSchema(BaseModel):
-    project_name: str = Field(..., description="Name of the project")
-    github_owner: str = Field(..., description="GitHub repository owner/organization")
-    github_repository: str = Field(..., description="GitHub repository name")
-    default_branch: Optional[str] = Field("main", description="Default branch name")
-    auth_type: str = Field("connected_account", description="Authentication mode: connected_account or custom_token")
-    custom_token: Optional[str] = Field(None, description="Optional custom GitHub Personal Access Token")
+    project_name: str = Field(..., min_length=1, max_length=100, description="Name of the project")
+    github_owner: str = Field(..., min_length=1, max_length=100, description="GitHub repository owner/organization")
+    github_repository: str = Field(..., min_length=1, max_length=100, description="GitHub repository name")
+    default_branch: Optional[str] = Field("main", max_length=100, description="Default branch name")
+    auth_type: str = Field("connected_account", max_length=50, description="Authentication mode: connected_account or custom_token")
+    custom_token: Optional[str] = Field(None, max_length=500, description="Optional custom GitHub Personal Access Token")
 
 class ProjectUpdateSchema(BaseModel):
-    project_name: Optional[str] = Field(None, description="Updated project name")
-    github_owner: Optional[str] = Field(None, description="Updated GitHub repository owner")
-    github_repository: Optional[str] = Field(None, description="Updated GitHub repository name")
-    default_branch: Optional[str] = Field(None, description="Updated default branch")
-    auth_type: Optional[str] = Field(None, description="Updated authentication mode")
-    custom_token: Optional[str] = Field(None, description="Updated custom GitHub token")
+    project_name: Optional[str] = Field(None, min_length=1, max_length=100, description="Updated project name")
+    github_owner: Optional[str] = Field(None, min_length=1, max_length=100, description="Updated GitHub repository owner")
+    github_repository: Optional[str] = Field(None, min_length=1, max_length=100, description="Updated GitHub repository name")
+    default_branch: Optional[str] = Field(None, max_length=100, description="Updated default branch")
+    auth_type: Optional[str] = Field(None, max_length=50, description="Updated authentication mode")
+    custom_token: Optional[str] = Field(None, max_length=500, description="Updated custom GitHub token")
 
 class ProjectResponseSchema(BaseModel):
     id: str
@@ -39,7 +39,7 @@ class ProjectResponseSchema(BaseModel):
     github_repository: str
     default_branch: str
     auth_type: str
-    custom_token: Optional[str] = None
+    has_custom_token: bool = False
     clone_path: Optional[str] = None
     chroma_path: Optional[str] = None
     current_commit_hash: Optional[str] = None

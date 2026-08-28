@@ -1,21 +1,55 @@
-from src.review.prompts import REVIEW_PROMPT,format_context
+from src.review.prompts import REVIEW_PROMPT, format_context
 from src.review.schemas import ReviewResult
 from src.retrieval.retrieval_pipeline import RetrievalPipeline
 from src.config import llm
 
+MAX_DIFF_LINES_PER_FILE = 500
+MAX_DIFF_CHARS_PER_FILE = 15000
+TRUNCATION_MARKER = "\n[Diff truncated for review: additional lines omitted]"
+
+def format_lines_with_limit(
+    lines: list[dict],
+    max_lines: int = MAX_DIFF_LINES_PER_FILE,
+    max_chars: int = MAX_DIFF_CHARS_PER_FILE
+) -> str:
+    """
+    Formats line list as 'line_no: text' strings up to max_lines and max_chars limit.
+    Appends a truncation marker if the threshold is exceeded.
+    Does NOT affect the full original diff retained for UI/database storage.
+    """
+    if not lines:
+        return "(none)"
+
+    formatted_lines: list[str] = []
+    total_chars = 0
+    truncated = False
+
+    for idx, line in enumerate(lines):
+        if idx >= max_lines:
+            truncated = True
+            break
+        line_str = f"{line.get('line', idx+1)}: {line.get('text', '')}"
+        if total_chars + len(line_str) + 1 > max_chars:
+            truncated = True
+            break
+        formatted_lines.append(line_str)
+        total_chars += len(line_str) + 1
+
+    result = "\n".join(formatted_lines)
+    if truncated:
+        result += TRUNCATION_MARKER
+
+    return result
+
 class ReviewPipeline:
 
-    def __init__(self,repository_name: str):
-        self.retriever=RetrievalPipeline(repository_name)
+    def __init__(self, repository_name: str):
+        self.retriever = RetrievalPipeline(repository_name)
+        self.llm = llm
+        self.structured_llm = llm.with_structured_output(ReviewResult)
+        self.chain = REVIEW_PROMPT | self.structured_llm
 
-        self.llm=llm
-
-        self.structured_llm=llm.with_structured_output(ReviewResult)
-
-
-        self.chain=REVIEW_PROMPT | self.structured_llm
-
-    def review_file(self,file_change: dict):
+    def review_file(self, file_change: dict):
         context_documents = (
             self.retriever.retrieve_context(
                 file_change
@@ -26,18 +60,15 @@ class ReviewPipeline:
             context_documents
         )
         
+        added_code_str = format_lines_with_limit(file_change.get("added_lines", []))
+        removed_code_str = format_lines_with_limit(file_change.get("removed_lines", []))
+
         review = self.chain.invoke(
             {
                 "context": context,
                 "filename": file_change["filename"],
-                "added_code": "\n".join(
-                    f"{line['line']}: {line['text']}"
-                    for line in file_change["added_lines"]
-                ),
-                "removed_code": "\n".join(
-                    f"{line['line']}: {line['text']}"
-                    for line in file_change["removed_lines"]
-                ),
+                "added_code": added_code_str,
+                "removed_code": removed_code_str,
             }
         )
         

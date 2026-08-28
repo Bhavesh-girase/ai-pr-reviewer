@@ -324,12 +324,13 @@ def test_create_and_execute_review_lifecycle_and_persistence(
 
             # 8: PRReviewer is actually invoked
             mock_reviewer_cls.assert_called_once_with(github_token="pat_test_123")
-            mock_reviewer_instance.review.assert_called_once_with(
-                repo_url="https://github.com/test-owner/test-repo",
-                owner="test-owner",
-                repository="test-repo",
-                pull_number=42
-            )
+            assert mock_reviewer_instance.review.called
+            review_call_kwargs = mock_reviewer_instance.review.call_args[1]
+            assert review_call_kwargs["repo_url"] == "https://github.com/test-owner/test-repo"
+            assert review_call_kwargs["owner"] == "test-owner"
+            assert review_call_kwargs["repository"] == "test-repo"
+            assert review_call_kwargs["pull_number"] == 42
+            assert "local_path" in review_call_kwargs
 
             # 9 & 11: Successful review -> COMPLETED with review_result persisted
             assert result["id"] == "rev-uuid-001"

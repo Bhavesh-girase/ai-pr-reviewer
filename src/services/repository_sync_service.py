@@ -11,6 +11,7 @@ from fastapi import HTTPException, status
 from git import Repo
 
 from src.api.auth import get_supabase_client
+from src.utils.security import encryption_service, sanitize_error_message
 from src.services.project_service import project_service
 from src.services.github_credentials_service import github_credentials_service
 from src.storage.project_storage import project_storage
@@ -42,6 +43,14 @@ class RepositorySyncService:
                 detail=f"Project with ID '{project_id}' not found."
             )
         project = res.data[0]
+
+        # Explicit service-layer ownership verification
+        if user_id and project.get("user_id") != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have permission to sync this project."
+            )
+
         target_user_id = user_id or project["user_id"]
 
         auth_type = project.get("auth_type", "connected_account")
@@ -49,7 +58,7 @@ class RepositorySyncService:
 
         token = None
         if auth_type == "custom_token" and custom_token:
-            token = custom_token.strip()
+            token = encryption_service.decrypt_or_passthrough(custom_token.strip())
         else:
             token = github_credentials_service.get_decrypted_pat(target_user_id, user_token)
 
@@ -142,27 +151,28 @@ class RepositorySyncService:
                 repo_path = Path(project.get("clone_path") or str(repo_dir))
                 chroma_path = Path(project.get("chroma_path") or str(chroma_dir))
 
-                # Step 3: Ensure local clone exists
-                auth_url = (
-                    f"https://x-access-token:{token}@github.com/{owner}/{repo_name}.git"
-                    if token else f"https://github.com/{owner}/{repo_name}.git"
-                )
+                # Step 3: Ensure local clone exists with clean URL (no credentials in .git/config)
+                clean_url = f"https://github.com/{owner}/{repo_name}.git"
 
                 if not (repo_path / ".git").exists():
                     logger.info(f"Cloning missing repository workspace for project {project_id}")
-                    Repo.clone_from(auth_url, repo_path)
+                    c_opts = [f"http.extraHeader=Authorization: Bearer {token}"] if token else None
+                    Repo.clone_from(clean_url, repo_path, c=c_opts)
 
                 git_repo = Repo(repo_path)
 
-                # Set origin URL with authenticated token
+                # Ensure origin URL is clean without credentials in .git/config
                 if "origin" in [remote.name for remote in git_repo.remotes]:
-                    git_repo.remotes.origin.set_url(auth_url)
+                    git_repo.remotes.origin.set_url(clean_url)
                 else:
-                    git_repo.create_remote("origin", auth_url)
+                    git_repo.create_remote("origin", clean_url)
 
-                # Step 4: Fetch remote branch
+                # Step 4: Fetch remote branch with ephemeral auth header
                 logger.info(f"Fetching latest changes for {owner}/{repo_name} (branch: {branch})")
-                git_repo.remotes.origin.fetch(branch)
+                if token:
+                    git_repo.git.fetch("origin", branch, c=f"http.extraHeader=Authorization: Bearer {token}")
+                else:
+                    git_repo.git.fetch("origin", branch)
 
                 # Step 5: Determine old and new commit hashes
                 old_commit = (
@@ -259,16 +269,19 @@ class RepositorySyncService:
                     "message": f"Successfully synchronized {total_changes} changed files to commit {new_commit[:7]}."
                 }
 
+            except HTTPException:
+                raise
             except Exception as e:
-                err_msg = f"Repository synchronization failed: {str(e)}"
-                logger.error(err_msg, exc_info=True)
+                sanitized_err = sanitize_error_message(str(e))
+                err_msg = f"Repository synchronization failed: {sanitized_err}"
+                logger.error(err_msg, exc_info=False)
 
                 # Rollback: Mark sync_status = SYNC_FAILED, keep previous commit intact
                 now_failed = datetime.now(timezone.utc).isoformat()
                 try:
                     supabase.table("projects").update({
                         "sync_status": "SYNC_FAILED",
-                        "sync_error_message": str(e),
+                        "sync_error_message": sanitized_err,
                         "last_sync_completed_at": now_failed
                     }).eq("id", project_id).execute()
                 except Exception:
