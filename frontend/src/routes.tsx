@@ -1,5 +1,6 @@
 import { createBrowserRouter } from 'react-router-dom'
 import AppLayout from './layouts/AppLayout'
+import LandingPage from './pages/LandingPage'
 import DashboardPage from './pages/DashboardPage'
 import ProjectsPage from './pages/ProjectsPage'
 import ProjectDetailsPage from './pages/ProjectDetailsPage'
@@ -12,18 +13,20 @@ import Register from './pages/Register'
 import ProtectedRoute from './components/ProtectedRoute'
 
 export const router = createBrowserRouter([
+  // Public landing page
   {
     path: '/',
+    element: <LandingPage />,
+  },
+
+  // Authenticated app shell
+  {
     element: (
       <ProtectedRoute>
         <AppLayout />
       </ProtectedRoute>
     ),
     children: [
-      {
-        index: true,
-        element: <DashboardPage />,
-      },
       {
         path: 'dashboard',
         element: <DashboardPage />,

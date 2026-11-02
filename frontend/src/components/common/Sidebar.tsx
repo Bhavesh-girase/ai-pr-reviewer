@@ -58,7 +58,7 @@ export default function Sidebar({ isCollapsed, onToggle }: SidebarProps) {
           </div>
           {!isCollapsed && (
             <span className="font-bold text-white tracking-tight text-sm whitespace-nowrap animate-fade-in">
-              AI PR Reviewer
+              RepoVela
             </span>
           )}
         </div>

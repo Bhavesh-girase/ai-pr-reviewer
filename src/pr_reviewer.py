@@ -34,20 +34,35 @@ class PRReviewer:
         repository: str,
         pull_number: int,
         local_path: Path | None = None,
+        chroma_path: str | Path | None = None,
     ):
         start_time = time.time()
         # --------------------------------------------------
         # Step 1 : Clone / Update repository
         # --------------------------------------------------
 
-        repository_path = prepare_repository(repo_url, local_path=local_path, token=self.github_token)
+        # A project workspace is already managed by repository sync. Pulling
+        # here would move the checkout without updating its corresponding
+        # vector index, so reviews use the last synchronized snapshot.
+        if (
+            chroma_path is not None
+            and local_path is not None
+            and (Path(local_path) / ".git").exists()
+        ):
+            repository_path = Path(local_path)
+        else:
+            repository_path = prepare_repository(repo_url, local_path=local_path, token=self.github_token)
         repository_name = Path(repository_path).name
 
         # --------------------------------------------------
         # Step 2 : Ensure repository index exists
         # --------------------------------------------------
 
-        self.index_manager.ensure_index(repository_path)
+        self.index_manager.ensure_index(
+            str(repository_path),
+            persist_directory=chroma_path,
+            repository_name=repository if chroma_path is not None else None,
+        )
 
         # --------------------------------------------------
         # Step 3 : Fetch changed files and PR details from GitHub
@@ -77,7 +92,11 @@ class PRReviewer:
         # Ensure we have the PR commits locally
         try:
             if self.github_token:
-                repo.git.fetch("origin", f"pull/{pull_number}/head", c=f"http.extraHeader=Authorization: Bearer {self.github_token}")
+                repo.git.set_persistent_git_options(c=f"http.extraHeader=Authorization: Bearer {self.github_token}")
+                try:
+                    repo.git.fetch("origin", f"pull/{pull_number}/head")
+                finally:
+                    repo.git.set_persistent_git_options()
             else:
                 repo.remotes.origin.fetch(f"pull/{pull_number}/head")
         except Exception as e:
@@ -114,7 +133,7 @@ class PRReviewer:
         # Step 5 : Review the pull request
         # --------------------------------------------------
 
-        review_pipeline = ReviewPipeline(repository_name)
+        review_pipeline = ReviewPipeline(repository_name, persist_directory=chroma_path)
 
         reviews, total_chunks = review_pipeline.review_pull_request(
             changed_files

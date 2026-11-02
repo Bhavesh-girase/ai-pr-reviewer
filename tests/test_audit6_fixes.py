@@ -56,6 +56,24 @@ def test_clone_repository_does_not_persist_pat_in_git_config():
             assert "Authorization" not in config_content
             assert "url = https://github.com/octocat/Hello-World.git" in config_content
 
+def test_update_repository_uses_persistent_git_options():
+    """Verify that update_repository uses set_persistent_git_options for ephemeral auth."""
+    from src.github.repository_manager import update_repository
+    secret_token = "ghp_TestSecretToken1234567890abcdef"
+    with patch("src.github.repository_manager.Repo") as mock_repo_cls:
+        mock_repo = MagicMock()
+        mock_repo_cls.return_value = mock_repo
+
+        update_repository(Path("/dummy/path"), token=secret_token)
+
+        # Ensure set_persistent_git_options was called with extraHeader
+        mock_repo.git.set_persistent_git_options.assert_any_call(
+            c=f"http.extraHeader=Authorization: Bearer {secret_token}"
+        )
+        mock_repo.git.pull.assert_called_once()
+        # Ensure cleanup reset occurred
+        assert mock_repo.git.set_persistent_git_options.call_count == 2
+
 # ----------------------------------------------------
 # 2. M-2: CENTRALIZED ERROR SANITIZER
 # ----------------------------------------------------

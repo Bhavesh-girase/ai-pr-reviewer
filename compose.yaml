@@ -1,19 +1,65 @@
+name: repovela
+
 services:
   backend:
     build:
       context: .
       dockerfile: Dockerfile
-
-    image: pr-previewer-backend:latest
-    container_name: pr-previewer-backend
-
-    ports:
-      - "8000:8000"
-
+    image: repovela-backend:latest
+    init: true
     env_file:
       - .env
-
+    environment:
+      APP_DATA_DIR: /app/data
+      HF_HOME: /app/data/huggingface
+    ports:
+      - "127.0.0.1:8000:8000"
+    expose:
+      - "8000"
     volumes:
-      - ./data:/app/data
-
+      - app_data:/app/data
     restart: unless-stopped
+    stop_grace_period: 5m
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10m
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+  caddy:
+    image: caddy:2-alpine
+    profiles:
+      - production
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      API_DOMAIN: ${API_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+
+volumes:
+  app_data:
+  caddy_data:
+  caddy_config:

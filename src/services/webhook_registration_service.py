@@ -4,6 +4,7 @@ import logging
 from typing import Dict, Any, Optional
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
+from starlette.concurrency import run_in_threadpool
 
 from src.api.auth import get_supabase_client
 from src.github.github_client import GitHubClient
@@ -13,6 +14,12 @@ from src.services.github_credentials_service import github_credentials_service
 from src.services.pull_request_sync_service import pull_request_sync_service
 
 logger = logging.getLogger(__name__)
+
+
+async def _execute(query):
+    """Execute a synchronous Supabase/PostgREST query outside the event loop."""
+    return await run_in_threadpool(query.execute)
+
 
 class WebhookRegistrationService:
     """
@@ -37,14 +44,11 @@ class WebhookRegistrationService:
         if not project:
             raise HTTPException(status_code=404, detail="Project not found.")
 
-        auth_type = project.get("auth_type", "connected_account")
-        custom_token = project.get("custom_token")
-
-        token = None
-        if auth_type == "custom_token" and custom_token:
-            token = encryption_service.decrypt_or_passthrough(custom_token.strip())
-        else:
-            token = github_credentials_service.get_decrypted_pat(user_id, user_token)
+        token = github_credentials_service.resolve_project_token(
+            project,
+            user_id,
+            user_token,
+        )
 
         if not token:
             raise HTTPException(
@@ -64,7 +68,12 @@ class WebhookRegistrationService:
         Generates encrypted secret, registers webhook on GitHub,
         updates DB to ACTIVE, and executes initial PR synchronization.
         """
-        project, token = self._resolve_project_and_token(project_id, user_id, user_token)
+        project, token = await run_in_threadpool(
+            self._resolve_project_and_token,
+            project_id,
+            user_id,
+            user_token,
+        )
         owner = project["github_owner"]
         repo = project["github_repository"]
         webhook_url = self._get_webhook_url()
@@ -73,35 +82,38 @@ class WebhookRegistrationService:
         raw_secret = secrets.token_hex(32)
         encrypted_secret = encryption_service.encrypt(raw_secret)
 
-        supabase = get_supabase_client(user_token)
+        supabase = await run_in_threadpool(get_supabase_client, user_token)
 
         # Mark status REGISTERING
-        supabase.table("projects").update({"webhook_status": "REGISTERING"}).eq("id", project_id).execute()
+        await _execute(
+            supabase.table("projects").update({"webhook_status": "REGISTERING"}).eq("id", project_id)
+        )
 
         # Step 2: Register on GitHub REST API
         client = GitHubClient(token=token)
         try:
-            hook_res = client.create_webhook(
+            hook_res = await run_in_threadpool(
+                client.create_webhook,
                 owner=owner,
                 repository=repo,
                 webhook_url=webhook_url,
                 secret=raw_secret,
-                events=["pull_request"]
+                events=["pull_request"],
             )
             webhook_id = hook_res.get("id")
         except HTTPException as he:
             logger.error(f"GitHub webhook registration failed for {owner}/{repo}: {he.detail}")
-            supabase.table("projects").update({
+            await _execute(supabase.table("projects").update({
                 "webhook_status": "FAILED",
                 "error_message": f"Webhook registration failed: {he.detail}"
-            }).eq("id", project_id).execute()
+            }).eq("id", project_id))
             raise
         except Exception as e:
             logger.error(f"Unexpected error registering webhook for {owner}/{repo}: {str(e)}")
-            supabase.table("projects").update({
+            await _execute(supabase.table("projects").update({
                 "webhook_status": "FAILED",
                 "error_message": f"Webhook registration failed: {str(e)}"
-            }).eq("id", project_id).execute()
+            }).eq("id", project_id))
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to register GitHub webhook: {str(e)}"
@@ -117,15 +129,16 @@ class WebhookRegistrationService:
             "webhook_secret_encrypted": encrypted_secret,
             "error_message": None
         }
-        supabase.table("projects").update(update_payload).eq("id", project_id).execute()
+        await _execute(supabase.table("projects").update(update_payload).eq("id", project_id))
 
         # Step 4: Perform Initial Pull Request Synchronization
         synced_count = 0
         try:
-            synced_count = pull_request_sync_service.sync_project_pull_requests(
+            synced_count = await run_in_threadpool(
+                pull_request_sync_service.sync_project_pull_requests,
                 project_id=project_id,
                 user_id=user_id,
-                user_token=user_token
+                user_token=user_token,
             )
         except Exception as e:
             logger.warning(f"Initial PR sync warning for project {project_id}: {str(e)}")
@@ -148,7 +161,12 @@ class WebhookRegistrationService:
         """
         Removes webhook from GitHub and updates project webhook_status to DISABLED.
         """
-        project, token = self._resolve_project_and_token(project_id, user_id, user_token)
+        project, token = await run_in_threadpool(
+            self._resolve_project_and_token,
+            project_id,
+            user_id,
+            user_token,
+        )
         owner = project["github_owner"]
         repo = project["github_repository"]
         hook_id = project.get("github_webhook_id")
@@ -156,16 +174,21 @@ class WebhookRegistrationService:
         if hook_id:
             client = GitHubClient(token=token)
             try:
-                client.delete_webhook(owner=owner, repository=repo, hook_id=int(hook_id))
+                await run_in_threadpool(
+                    client.delete_webhook,
+                    owner=owner,
+                    repository=repo,
+                    hook_id=int(hook_id),
+                )
             except Exception as e:
                 logger.warning(f"Failed to delete webhook #{hook_id} from GitHub: {str(e)}")
 
-        supabase = get_supabase_client(user_token)
-        supabase.table("projects").update({
+        supabase = await run_in_threadpool(get_supabase_client, user_token)
+        await _execute(supabase.table("projects").update({
             "github_webhook_id": None,
             "webhook_status": "DISABLED",
             "webhook_secret_encrypted": None
-        }).eq("id", project_id).execute()
+        }).eq("id", project_id))
 
         return {"message": "Webhook unregistered successfully."}
 

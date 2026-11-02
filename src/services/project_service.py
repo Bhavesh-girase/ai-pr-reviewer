@@ -1,6 +1,7 @@
 import logging
 from typing import List, Dict, Any, Optional
 from fastapi import HTTPException, status
+from starlette.concurrency import run_in_threadpool
 from src.api.auth import get_supabase_client
 from src.github.github_client import GitHubClient
 from src.utils.security import encryption_service, sanitize_error_message
@@ -48,11 +49,11 @@ class ProjectService:
         return data
 
     def _get_github_client_for_user(self, user_id: str, user_token: str, auth_type: str, custom_token: Optional[str]) -> GitHubClient:
-        token = None
-        if auth_type == "custom_token" and custom_token:
-            token = encryption_service.decrypt_or_passthrough(custom_token.strip())
-        else:
-            token = github_credentials_service.get_decrypted_pat(user_id, user_token)
+        token = github_credentials_service.resolve_project_token(
+            {"auth_type": auth_type, "custom_token": custom_token},
+            user_id,
+            user_token,
+        )
         return GitHubClient(token=token)
 
     def get_user_projects(self, user_id: str, user_token: str) -> List[Dict[str, Any]]:
@@ -89,9 +90,15 @@ class ProjectService:
         custom_token = input_data.get("custom_token")
 
         # Step 1: Validate repository existence with GitHub API
-        gh_client = self._get_github_client_for_user(user_id, user_token, auth_type, custom_token)
+        gh_client = await run_in_threadpool(
+            self._get_github_client_for_user,
+            user_id,
+            user_token,
+            auth_type,
+            custom_token,
+        )
         try:
-            repo_info = gh_client.get_repository(owner, repo)
+            repo_info = await run_in_threadpool(gh_client.get_repository, owner, repo)
             default_branch = input_data.get("default_branch") or repo_info.get("default_branch") or "main"
         except Exception as e:
             raise HTTPException(
@@ -115,9 +122,11 @@ class ProjectService:
             "status": "CREATING"
         }
 
-        supabase = get_supabase_client(user_token)
+        supabase = await run_in_threadpool(get_supabase_client, user_token)
         try:
-            res = supabase.table(self.TABLE_NAME).insert(db_payload).execute()
+            res = await run_in_threadpool(
+                lambda: supabase.table(self.TABLE_NAME).insert(db_payload).execute()
+            )
             if not res.data or len(res.data) == 0:
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -148,7 +157,9 @@ class ProjectService:
 
         # Step 4: Update final status & paths in DB
         try:
-            final_res = supabase.table(self.TABLE_NAME).update(provision_res).eq("id", project_id).execute()
+            final_res = await run_in_threadpool(
+                lambda: supabase.table(self.TABLE_NAME).update(provision_res).eq("id", project_id).execute()
+            )
             saved = final_res.data[0] if final_res.data else project_record
             return self._format_project(saved, sanitize=True)
         except Exception as e:
@@ -156,7 +167,13 @@ class ProjectService:
             return self._format_project(project_record, sanitize=True)
 
     async def update_project(self, project_id: str, user_id: str, user_token: str, update_data: dict) -> Dict[str, Any]:
-        existing = self.get_project_by_id(project_id, user_id, user_token, sanitize=False)
+        existing = await run_in_threadpool(
+            self.get_project_by_id,
+            project_id,
+            user_id,
+            user_token,
+            sanitize=False,
+        )
 
         new_owner = update_data.get("github_owner") or existing["github_owner"]
         new_repo = update_data.get("github_repository") or existing["github_repository"]
@@ -170,9 +187,19 @@ class ProjectService:
             else:
                 payload["custom_token"] = None
 
-        supabase = get_supabase_client(user_token)
+        effective_project = {**existing, **payload}
+        effective_auth_type = github_credentials_service.get_project_auth_type(effective_project)
+        if effective_auth_type == "custom_token" and not effective_project.get("custom_token"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A custom GitHub token is required when this project uses custom-token authentication.",
+            )
+
+        supabase = await run_in_threadpool(get_supabase_client, user_token)
         try:
-            res = supabase.table(self.TABLE_NAME).update(payload).eq("id", project_id).execute()
+            res = await run_in_threadpool(
+                lambda: supabase.table(self.TABLE_NAME).update(payload).eq("id", project_id).execute()
+            )
             updated_record = res.data[0] if res.data else existing
         except Exception as e:
             self._handle_db_error(e, f"update project {project_id}")
@@ -180,7 +207,7 @@ class ProjectService:
 
         # If repo changed, re-provision workspace
         if repo_changed:
-            project_storage.cleanup_project_storage(user_id, project_id)
+            await run_in_threadpool(project_storage.cleanup_project_storage, user_id, project_id)
 
             def update_status(pid: str, new_status: str):
                 supabase.table(self.TABLE_NAME).update({"status": new_status}).eq("id", pid).execute()
@@ -190,7 +217,9 @@ class ProjectService:
                 user_token,
                 update_status
             )
-            final_res = supabase.table(self.TABLE_NAME).update(provision_res).eq("id", project_id).execute()
+            final_res = await run_in_threadpool(
+                lambda: supabase.table(self.TABLE_NAME).update(provision_res).eq("id", project_id).execute()
+            )
             saved = final_res.data[0] if final_res.data else updated_record
             return self._format_project(saved, sanitize=True)
 
@@ -200,14 +229,22 @@ class ProjectService:
         # Verify ownership first
         self.get_project_by_id(project_id, user_id, user_token, sanitize=False)
 
+        # Remove local source and vector data before cascading the DB record. If
+        # cleanup fails, keep the project row so the owner can retry deletion.
+        try:
+            project_storage.cleanup_project_storage(user_id, project_id)
+        except Exception as e:
+            logger.error(f"Project storage deletion failed for {project_id}: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Project code storage could not be securely deleted. Please retry or contact support.",
+            )
+
         supabase = get_supabase_client(user_token)
         try:
             supabase.table(self.TABLE_NAME).delete().eq("id", project_id).execute()
         except Exception as e:
             self._handle_db_error(e, f"delete project {project_id}")
-
-        # Delete local clone and Chroma directories
-        project_storage.cleanup_project_storage(user_id, project_id)
 
         return {"message": f"Project '{project_id}' and storage resources deleted successfully."}
 

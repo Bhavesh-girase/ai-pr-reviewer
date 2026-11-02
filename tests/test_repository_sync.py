@@ -2,6 +2,8 @@ import json
 import hmac
 import hashlib
 import asyncio
+import threading
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
 import pytest
@@ -101,6 +103,9 @@ def test_manual_repository_sync_already_up_to_date(mock_project_data):
     asyncio.run(run())
 
 def test_manual_repository_sync_with_changes(mock_project_data):
+    main_thread_id = threading.get_ident()
+    worker_thread_ids = []
+
     async def run():
         service = RepositorySyncService()
         mock_supabase = MagicMock()
@@ -108,17 +113,28 @@ def test_manual_repository_sync_with_changes(mock_project_data):
 
         mock_repo = setup_mock_git_repo("commit_aaa_111", "commit_bbb_222")
 
+        def repo_factory(*args, **kwargs):
+            worker_thread_ids.append(threading.get_ident())
+            return mock_repo
+
+        def sync_index(*args, **kwargs):
+            worker_thread_ids.append(threading.get_ident())
+            return 6
+
         with patch("src.services.repository_sync_service.get_supabase_client", return_value=mock_supabase), \
              patch.object(service, "_resolve_project_and_token", return_value=(mock_project_data, "token_123")), \
-             patch("src.services.repository_sync_service.Repo", return_value=mock_repo), \
+             patch("src.services.repository_sync_service.Repo", side_effect=repo_factory), \
              patch.object(service, "_detect_git_changes", return_value=(["added.py"], ["modified.py"], ["deleted.py"], [])) as mock_diff, \
-             patch("src.sync.incremental_indexer.IncrementalIndexer.sync_changes", return_value=6) as mock_sync:
+             patch("src.sync.incremental_indexer.IncrementalIndexer.sync_changes", side_effect=sync_index) as mock_sync:
 
             result = await service.sync_project_repository("proj-uuid-123")
             assert result["status"] == "READY"
             assert result["current_commit"] == "commit_bbb_222"
             assert result["changed_files_count"] == 3
             mock_sync.assert_called_once()
+            assert len(worker_thread_ids) == 2
+            assert all(thread_id != main_thread_id for thread_id in worker_thread_ids)
+            assert worker_thread_ids[0] == worker_thread_ids[1]
 
     asyncio.run(run())
 
@@ -169,7 +185,15 @@ def test_push_webhook_on_default_branch(sample_secret, mock_project_data):
         mock_supabase.table.return_value.select.return_value.ilike.return_value.ilike.return_value.execute.return_value.data = [mock_project_data]
         mock_supabase.table.return_value.insert.return_value.execute.return_value.data = [{"id": "deliv-rec-1"}]
 
+        execute = AsyncMock(side_effect=[
+            SimpleNamespace(data=[mock_project_data]),
+            SimpleNamespace(data=[{"id": "deliv-rec-1"}]),
+            SimpleNamespace(data=[]),
+            SimpleNamespace(data=[]),
+        ])
+
         with patch("src.services.webhook_service.get_supabase_client", return_value=mock_supabase), \
+             patch("src.services.webhook_service._execute", execute), \
              patch("src.services.repository_sync_service.repository_sync_service.sync_project_repository", return_value={"status": "READY"}) as mock_repo_sync:
 
             result = await service.handle_webhook(raw_body, headers)
@@ -209,7 +233,14 @@ def test_push_webhook_on_non_default_branch_ignored(sample_secret, mock_project_
         mock_supabase.table.return_value.select.return_value.ilike.return_value.ilike.return_value.execute.return_value.data = [mock_project_data]
         mock_supabase.table.return_value.insert.return_value.execute.return_value.data = [{"id": "deliv-rec-2"}]
 
+        execute = AsyncMock(side_effect=[
+            SimpleNamespace(data=[mock_project_data]),
+            SimpleNamespace(data=[{"id": "deliv-rec-2"}]),
+            SimpleNamespace(data=[]),
+        ])
+
         with patch("src.services.webhook_service.get_supabase_client", return_value=mock_supabase), \
+             patch("src.services.webhook_service._execute", execute), \
              patch("src.services.repository_sync_service.repository_sync_service.sync_project_repository") as mock_repo_sync:
 
             result = await service.handle_webhook(raw_body, headers)

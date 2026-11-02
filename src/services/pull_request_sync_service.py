@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from fastapi import HTTPException
 from src.api.auth import get_supabase_client
 from src.github.github_client import GitHubClient
-from src.utils.security import encryption_service
 from src.services.github_credentials_service import github_credentials_service
 
 logger = logging.getLogger(__name__)
@@ -34,14 +33,11 @@ class PullRequestSyncService:
         project = res.data[0]
 
         target_user_id = user_id or project["user_id"]
-        auth_type = project.get("auth_type", "connected_account")
-        custom_token = project.get("custom_token")
-
-        token = None
-        if auth_type == "custom_token" and custom_token:
-            token = encryption_service.decrypt_or_passthrough(custom_token.strip())
-        else:
-            token = github_credentials_service.get_decrypted_pat(target_user_id, user_token)
+        token = github_credentials_service.resolve_project_token(
+            project,
+            target_user_id,
+            user_token,
+        )
 
         return project, token
 
@@ -177,8 +173,9 @@ class PullRequestSyncService:
         client = GitHubClient(token=token)
         logger.info(f"Initiating full PR sync for project {project_id} ({owner}/{repo})")
 
-        # Fetch all PRs (open, closed, merged)
-        prs = client.list_pull_requests(owner=owner, repository=repo, state="all", page=1, per_page=100)
+        # Fetch every page so repositories with more than 100 PRs have a
+        # complete local cache for review history and analytics.
+        prs = client.list_all_pull_requests(owner=owner, repository=repo, state="all")
 
         synced_count = 0
         for pr in prs:

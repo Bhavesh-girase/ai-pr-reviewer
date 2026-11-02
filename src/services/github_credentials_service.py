@@ -1,6 +1,7 @@
 import logging
 from typing import Optional, Dict, Any
 from fastapi import HTTPException, status
+from starlette.concurrency import run_in_threadpool
 from src.api.auth import get_supabase_client
 from src.utils.security import encryption_service
 from src.services.github_service import github_service
@@ -15,6 +16,56 @@ class GitHubCredentialsService:
     """
 
     TABLE_NAME = "github_credentials"
+
+    def get_project_auth_type(self, project: Dict[str, Any]) -> str:
+        """Return a supported auth mode, defaulting legacy rows to connected accounts."""
+        auth_type = project.get("auth_type") or "connected_account"
+        if auth_type not in {"connected_account", "custom_token"}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Unsupported GitHub authentication mode for this project.",
+            )
+        return auth_type
+
+    def resolve_custom_token(self, project: Dict[str, Any]) -> str:
+        """Resolve a project-scoped token without silently switching credentials."""
+        encrypted_token = project.get("custom_token")
+        if not isinstance(encrypted_token, str) or not encrypted_token.strip():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This project is configured for a custom GitHub token, but none is saved. Update the project credentials.",
+            )
+
+        try:
+            token = encryption_service.decrypt_or_passthrough(encrypted_token.strip())
+        except Exception:
+            logger.error(
+                "Failed to resolve custom GitHub token for project %s",
+                project.get("id", "unknown"),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to decrypt project GitHub credentials.",
+            )
+
+        if not token:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This project is configured for a custom GitHub token, but none is saved. Update the project credentials.",
+            )
+        return token
+
+    def resolve_project_token(
+        self,
+        project: Dict[str, Any],
+        user_id: str,
+        user_token: Optional[str] = None,
+    ) -> str:
+        """Resolve only the credential source selected by the project's auth mode."""
+        auth_type = self.get_project_auth_type(project)
+        if auth_type == "custom_token":
+            return self.resolve_custom_token(project)
+        return self.get_decrypted_pat(user_id, user_token)
 
     def _handle_db_error(self, e: Exception, operation: str) -> None:
         """
@@ -93,10 +144,12 @@ class GitHubCredentialsService:
         }
 
         try:
-            supabase = get_supabase_client(user_token)
+            supabase = await run_in_threadpool(get_supabase_client, user_token)
             
             # Atomic upsert on conflict user_id
-            res = supabase.table(self.TABLE_NAME).upsert(payload, on_conflict="user_id").execute()
+            res = await run_in_threadpool(
+                lambda: supabase.table(self.TABLE_NAME).upsert(payload, on_conflict="user_id").execute()
+            )
 
             if not res.data:
                 raise HTTPException(

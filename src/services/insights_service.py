@@ -3,10 +3,44 @@ from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 from fastapi import HTTPException, status
+from starlette.concurrency import run_in_threadpool
 
 from src.api.auth import get_supabase_client
 
 logger = logging.getLogger("insights_service")
+
+INSIGHTS_PAGE_SIZE = 500
+
+
+def _iter_project_rows(
+    supabase,
+    table_name: str,
+    columns: str,
+    project_id: str,
+    cutoff_iso: Optional[str],
+    *,
+    status_filter: Optional[str] = None,
+    order_by: Optional[str] = None,
+):
+    """Yield bounded pages so PostgREST's row cap cannot truncate analytics."""
+    offset = 0
+    while True:
+        query = supabase.table(table_name).select(columns).eq("project_id", project_id)
+        if cutoff_iso:
+            query = query.gte("created_at", cutoff_iso)
+        if status_filter:
+            query = query.eq("status", status_filter)
+        if order_by:
+            query = query.order(order_by, desc=True).order("id", desc=True)
+
+        result = query.range(offset, offset + INSIGHTS_PAGE_SIZE - 1).execute()
+        rows = result.data or []
+        yield from rows
+
+        if len(rows) < INSIGHTS_PAGE_SIZE:
+            return
+        offset += INSIGHTS_PAGE_SIZE
+
 
 class InsightsService:
     """
@@ -21,7 +55,12 @@ class InsightsService:
         user_token: str
     ) -> Dict[str, Any]:
         supabase = get_supabase_client(user_token)
-        proj_res = supabase.table("projects").select("*").eq("id", project_id).execute()
+        proj_res = (
+            supabase.table("projects")
+            .select("id, user_id, sync_status, last_synced_at")
+            .eq("id", project_id)
+            .execute()
+        )
         if not proj_res.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -56,40 +95,60 @@ class InsightsService:
         user_token: str,
         range_str: str = "30d"
     ) -> Dict[str, Any]:
+        """Run synchronous database reads and analytics outside the event loop."""
+        return await run_in_threadpool(
+            self._get_project_insights_sync,
+            project_id,
+            user_id,
+            user_token,
+            range_str,
+        )
+
+    def _get_project_insights_sync(
+        self,
+        project_id: str,
+        user_id: str,
+        user_token: str,
+        range_str: str = "30d"
+    ) -> Dict[str, Any]:
         """
         Aggregates and returns comprehensive project insights for the specified date range.
         """
         supabase = get_supabase_client(user_token)
         project = self._resolve_project(project_id, user_id, user_token)
+        range_str = str(getattr(range_str, "value", range_str)).lower()
+        if range_str not in {"7d", "30d", "90d", "all"}:
+            range_str = "30d"
         cutoff = self._get_date_cutoff(range_str)
         cutoff_iso = cutoff.isoformat() if cutoff else None
 
-        # 1. Fetch Pull Requests for the project
-        pr_query = supabase.table("pull_requests").select("*").eq("project_id", project_id)
-        if cutoff_iso:
-            pr_query = pr_query.gte("created_at", cutoff_iso)
-        pr_res = pr_query.order("created_at", desc=True).execute()
-        pull_requests = pr_res.data or []
+        # 1. Aggregate PR fields in bounded pages; avoid loading unused columns.
+        total_prs = open_prs = merged_prs = closed_prs = draft_prs = 0
+        changed_files_sum = additions_sum = deletions_sum = 0
+        latest_pr_rows = []
+        for pr in _iter_project_rows(
+            supabase,
+            "pull_requests",
+            "id, github_pr_number, title, state, draft, additions, deletions, changed_files, created_at, updated_at, author_login",
+            project_id,
+            cutoff_iso,
+            order_by="created_at",
+        ):
+            total_prs += 1
+            state = pr.get("state")
+            open_prs += state == "OPEN"
+            merged_prs += state == "MERGED"
+            closed_prs += state == "CLOSED"
+            draft_prs += bool(pr.get("draft") or pr.get("is_draft") or state == "DRAFT")
+            changed_files_sum += pr.get("changed_files_count") or pr.get("changed_files") or 0
+            additions_sum += pr.get("additions") or 0
+            deletions_sum += pr.get("deletions") or 0
+            if len(latest_pr_rows) < 5:
+                latest_pr_rows.append(pr)
 
-        # Also get all PRs count if date filtered, or calculate PR stats from filtered set
-        total_prs = len(pull_requests)
-        open_prs = sum(1 for p in pull_requests if p.get("state") == "OPEN")
-        merged_prs = sum(1 for p in pull_requests if p.get("state") == "MERGED")
-        closed_prs = sum(1 for p in pull_requests if p.get("state") == "CLOSED")
-        draft_prs = sum(1 for p in pull_requests if p.get("is_draft") is True or p.get("state") == "DRAFT")
-
-        avg_changed_files = (
-            round(sum(p.get("changed_files_count", 0) for p in pull_requests) / total_prs, 1)
-            if total_prs > 0 else 0.0
-        )
-        avg_additions = (
-            round(sum(p.get("additions", 0) for p in pull_requests) / total_prs, 1)
-            if total_prs > 0 else 0.0
-        )
-        avg_deletions = (
-            round(sum(p.get("deletions", 0) for p in pull_requests) / total_prs, 1)
-            if total_prs > 0 else 0.0
-        )
+        avg_changed_files = round(changed_files_sum / total_prs, 1) if total_prs else 0.0
+        avg_additions = round(additions_sum / total_prs, 1) if total_prs else 0.0
+        avg_deletions = round(deletions_sum / total_prs, 1) if total_prs else 0.0
 
         pr_stats = {
             "total_prs": total_prs,
@@ -102,37 +161,65 @@ class InsightsService:
             "avg_deletions": avg_deletions
         }
 
-        # 2. Fetch Reviews for the project in the date range
-        review_query = supabase.table("reviews").select("*").eq("project_id", project_id)
-        if cutoff_iso:
-            review_query = review_query.gte("created_at", cutoff_iso)
-        review_res = review_query.order("created_at", desc=True).execute()
-        reviews = review_res.data or []
-
-        total_reviews = len(reviews)
-        completed_reviews = [r for r in reviews if r.get("status") == "COMPLETED"]
-        failed_reviews = [r for r in reviews if r.get("status") == "FAILED"]
-        completed_count = len(completed_reviews)
-        failed_count = len(failed_reviews)
-
-        # Overview Issue Totals
-        total_issues_detected = sum(r.get("issues_count", 0) for r in completed_reviews)
-        critical_count = sum(r.get("critical_count", 0) for r in completed_reviews)
-        high_count = sum(r.get("high_count", 0) for r in completed_reviews)
-        medium_count = sum(r.get("medium_count", 0) for r in completed_reviews)
-        low_count = sum(r.get("low_count", 0) for r in completed_reviews)
-
-        # Review Performance
-        valid_durations = [
-            r["review_duration_ms"] for r in completed_reviews
-            if r.get("review_duration_ms") and r["review_duration_ms"] > 0
-        ]
-        avg_duration_ms = (
-            int(sum(valid_durations) / len(valid_durations))
-            if valid_durations else 0
+        # 2. Aggregate compact review rows in bounded pages. Large JSONB review
+        # payloads are fetched separately and one page at a time below.
+        review_columns = (
+            "id, pull_request_id, github_pr_number, status, issues_count, "
+            "critical_count, high_count, medium_count, low_count, "
+            "review_duration_ms, created_at, head_commit_sha"
         )
-        fastest_duration_ms = min(valid_durations) if valid_durations else None
-        slowest_duration_ms = max(valid_durations) if valid_durations else None
+        total_reviews = completed_count = failed_count = 0
+        total_issues_detected = critical_count = high_count = medium_count = low_count = 0
+        duration_sum = duration_count = 0
+        fastest_duration_ms = slowest_duration_ms = None
+        latest_review_rows = []
+        activity_map = defaultdict(lambda: {"total": 0, "completed": 0, "failed": 0})
+        trend_map = defaultdict(lambda: {"critical": 0, "high": 0, "medium": 0, "low": 0})
+
+        for review in _iter_project_rows(
+            supabase,
+            "reviews",
+            review_columns,
+            project_id,
+            cutoff_iso,
+            order_by="created_at",
+        ):
+            total_reviews += 1
+            if len(latest_review_rows) < 5:
+                latest_review_rows.append(review)
+
+            review_status = review.get("status")
+            created_at = review.get("created_at")
+            if created_at:
+                date_key = str(created_at)[:10]
+                activity_map[date_key]["total"] += 1
+
+            if review_status == "COMPLETED":
+                completed_count += 1
+                total_issues_detected += review.get("issues_count") or 0
+                critical_count += review.get("critical_count") or 0
+                high_count += review.get("high_count") or 0
+                medium_count += review.get("medium_count") or 0
+                low_count += review.get("low_count") or 0
+                if created_at:
+                    activity_map[date_key]["completed"] += 1
+                    trend_map[date_key]["critical"] += review.get("critical_count") or 0
+                    trend_map[date_key]["high"] += review.get("high_count") or 0
+                    trend_map[date_key]["medium"] += review.get("medium_count") or 0
+                    trend_map[date_key]["low"] += review.get("low_count") or 0
+
+                duration = review.get("review_duration_ms") or 0
+                if duration > 0:
+                    duration_sum += duration
+                    duration_count += 1
+                    fastest_duration_ms = duration if fastest_duration_ms is None else min(fastest_duration_ms, duration)
+                    slowest_duration_ms = duration if slowest_duration_ms is None else max(slowest_duration_ms, duration)
+            elif review_status == "FAILED":
+                failed_count += 1
+                if created_at:
+                    activity_map[date_key]["failed"] += 1
+
+        avg_duration_ms = int(duration_sum / duration_count) if duration_count else 0
 
         active_finished_count = completed_count + failed_count
         success_rate = (
@@ -151,18 +238,6 @@ class InsightsService:
         }
 
         # 3. Review Activity Time Series (Daily)
-        activity_map = defaultdict(lambda: {"total": 0, "completed": 0, "failed": 0})
-        for r in reviews:
-            created_str = r.get("created_at")
-            if created_str:
-                date_key = created_str[:10]
-                activity_map[date_key]["total"] += 1
-                if r.get("status") == "COMPLETED":
-                    activity_map[date_key]["completed"] += 1
-                elif r.get("status") == "FAILED":
-                    activity_map[date_key]["failed"] += 1
-
-        # Sort chronological
         sorted_dates = sorted(activity_map.keys())
         review_activity = [
             {
@@ -183,16 +258,6 @@ class InsightsService:
             "total_issues": total_issues_detected
         }
 
-        trend_map = defaultdict(lambda: {"critical": 0, "high": 0, "medium": 0, "low": 0})
-        for r in completed_reviews:
-            created_str = r.get("created_at")
-            if created_str:
-                date_key = created_str[:10]
-                trend_map[date_key]["critical"] += r.get("critical_count", 0)
-                trend_map[date_key]["high"] += r.get("high_count", 0)
-                trend_map[date_key]["medium"] += r.get("medium_count", 0)
-                trend_map[date_key]["low"] += r.get("low_count", 0)
-
         sorted_trend_dates = sorted(trend_map.keys())
         severity_trends = [
             {
@@ -207,20 +272,28 @@ class InsightsService:
 
         # 5. Dynamically Derive Issue Categories from review_result JSONB
         category_counts = defaultdict(int)
-        file_metrics = defaultdict(lambda: {"total_issues": 0, "high_critical": 0, "review_count": 0, "seen_reviews": set()})
+        file_metrics = defaultdict(lambda: {"total_issues": 0, "high_critical": 0, "review_count": 0})
 
-        for r in completed_reviews:
-            r_id = r.get("id")
-            result_json = r.get("review_result") or {}
+        for review_result_row in _iter_project_rows(
+            supabase,
+            "reviews",
+            "id, review_result",
+            project_id,
+            cutoff_iso,
+            status_filter="COMPLETED",
+            order_by="created_at",
+        ):
+            result_json = review_result_row.get("review_result") or {}
             files_list = result_json.get("reviews") or []
+            seen_files = set()
 
             for f_item in files_list:
                 fname = f_item.get("filename") or "unknown"
                 rev_obj = f_item.get("review") or {}
                 issues_list = rev_obj.get("issues") or []
 
-                if r_id not in file_metrics[fname]["seen_reviews"]:
-                    file_metrics[fname]["seen_reviews"].add(r_id)
+                if fname not in seen_files:
+                    seen_files.add(fname)
                     file_metrics[fname]["review_count"] += 1
 
                 for iss in issues_list:
@@ -303,34 +376,43 @@ class InsightsService:
         }
 
         # 8. Latest Reviews & Latest Pull Requests
-        # Build PR title map for latest reviews
+        # Resolve titles only for the latest review cards rather than retaining
+        # every PR row in memory for the entire analytics request.
         latest_reviews = []
-        if reviews:
-            pr_map = {p["id"]: p.get("title") for p in pull_requests}
-            for r in reviews[:5]:
-                latest_reviews.append({
-                    "id": r["id"],
-                    "github_pr_number": r["github_pr_number"],
-                    "pr_title": pr_map.get(r.get("pull_request_id")),
-                    "status": r.get("status", "QUEUED"),
-                    "issues_count": r.get("issues_count", 0),
-                    "high_count": r.get("high_count", 0),
-                    "critical_count": r.get("critical_count", 0),
-                    "head_commit_sha": r.get("head_commit_sha"),
-                    "created_at": r.get("created_at")
-                })
+        pr_map = {}
+        latest_pr_ids = list({r.get("pull_request_id") for r in latest_review_rows if r.get("pull_request_id")})
+        if latest_pr_ids:
+            pr_result = (
+                supabase.table("pull_requests")
+                .select("id, title")
+                .eq("project_id", project_id)
+                .in_("id", latest_pr_ids)
+                .execute()
+            )
+            pr_map = {p["id"]: p.get("title") for p in (pr_result.data or [])}
+
+        for review in latest_review_rows:
+            latest_reviews.append({
+                "id": review["id"],
+                "github_pr_number": review["github_pr_number"],
+                "pr_title": pr_map.get(review.get("pull_request_id")),
+                "status": review.get("status", "QUEUED"),
+                "issues_count": review.get("issues_count", 0),
+                "high_count": review.get("high_count", 0),
+                "critical_count": review.get("critical_count", 0),
+                "head_commit_sha": review.get("head_commit_sha"),
+                "created_at": review.get("created_at")
+            })
 
         latest_pull_requests = []
-        for p in pull_requests[:5]:
-            author_data = p.get("author") or {}
-            author_login = p.get("author_username") or p.get("author_login") or (author_data.get("login") if isinstance(author_data, dict) else "unknown")
+        for pull_request in latest_pr_rows:
             latest_pull_requests.append({
-                "github_pr_number": p.get("github_pr_number", 0),
-                "title": p.get("title", ""),
-                "state": p.get("state", "OPEN"),
-                "author_login": author_login or "unknown",
-                "changed_files_count": p.get("changed_files_count", 0),
-                "updated_at": p.get("updated_at") or p.get("created_at")
+                "github_pr_number": pull_request.get("github_pr_number", 0),
+                "title": pull_request.get("title", ""),
+                "state": pull_request.get("state", "OPEN"),
+                "author_login": pull_request.get("author_login") or "unknown",
+                "changed_files_count": pull_request.get("changed_files_count") or pull_request.get("changed_files", 0),
+                "updated_at": pull_request.get("updated_at") or pull_request.get("created_at")
             })
 
         overview = {
@@ -345,7 +427,7 @@ class InsightsService:
             "avg_review_duration_ms": avg_duration_ms
         }
 
-        has_data = Boolean = bool(total_reviews > 0 or total_prs > 0)
+        has_data = bool(total_reviews > 0 or total_prs > 0)
 
         return {
             "project_id": project_id,

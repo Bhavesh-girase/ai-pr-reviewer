@@ -8,6 +8,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import {
   ChevronRight,
   ArrowLeft,
+  Loader2,
   Sparkles,
   GitPullRequest,
   Clock,
@@ -55,7 +56,7 @@ export default function ReviewDetailsPage() {
   const reReviewMutation = useMutation({
     mutationFn: () => reviewProjectPullRequest(projectId || '', review?.github_pr_number || 0),
     onSuccess: (data) => {
-      toast.success('New AI review completed successfully!')
+      toast.success('New AI review queued. It will start when a worker is available.')
       if (data.review_id) {
         navigate(`/projects/${projectId}/reviews/${data.review_id}`)
       } else {
@@ -184,7 +185,7 @@ export default function ReviewDetailsPage() {
             <div className="flex items-center gap-4 text-xs text-zinc-400 flex-wrap pt-0.5">
               <span className="flex items-center gap-1 text-zinc-400">
                 <Bot className="h-3.5 w-3.5 text-indigo-400" />
-                <span>{review.model_name || 'Gemini 2.5 Flash'}</span>
+                <span>AI</span>
               </span>
 
               {durationSec && (
@@ -214,16 +215,40 @@ export default function ReviewDetailsPage() {
 
             <button
               onClick={() => reReviewMutation.mutate()}
-              disabled={reReviewMutation.isPending}
+              disabled={
+                reReviewMutation.isPending ||
+                review.status === 'QUEUED' ||
+                review.status === 'RUNNING'
+              }
               className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-xs font-bold text-white shadow-md shadow-indigo-600/20 transition-all cursor-pointer hover:scale-105"
             >
               <Sparkles className="h-4 w-4" />
-              <span>{reReviewMutation.isPending ? 'Running Review...' : 'Review Again'}</span>
+              <span>{reReviewMutation.isPending ? 'Queueing Review...' : 'Review Again'}</span>
             </button>
           </div>
-        </div>
+      </div>
 
-        {/* Quick Stats Strip */}
+      {(review.status === 'QUEUED' || review.status === 'RUNNING') && (
+        <div className="flex items-start gap-3 rounded-xl border border-indigo-500/20 bg-indigo-950/20 p-4 text-xs">
+          <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-indigo-400" />
+          <div>
+            <p className="font-semibold text-white">
+              {review.status === 'QUEUED' ? 'Review waiting in queue' : 'Review in progress'}
+            </p>
+            <p className="mt-1 text-zinc-400">
+              This page updates automatically when a review worker starts or finishes the job.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {review.status === 'FAILED' && review.error_message && (
+        <div className="rounded-xl border border-red-950 bg-red-950/20 p-4 text-xs text-red-300">
+          {review.error_message}
+        </div>
+      )}
+
+      {/* Quick Stats Strip */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-3 border-t border-zinc-900 text-xs">
           <div className="bg-zinc-900/60 border border-zinc-850 p-3 rounded-xl space-y-1">
             <span className="text-[10px] uppercase font-bold text-zinc-500 flex items-center gap-1">

@@ -7,8 +7,9 @@ import {
   getPullRequestFiles,
   getPullRequestDiff,
 } from '@/api/pullRequests'
-import { getPullRequestReviews, reviewProjectPullRequest } from '@/api/reviews'
+import { getPullRequestReviews, getReviewById, reviewProjectPullRequest } from '@/api/reviews'
 import type { PullRequestFile } from '@/types/pullRequest'
+import type { ReviewDetail } from '@/types/review'
 import { PullRequestStatusBadge } from '@/components/pull_requests/PullRequestStatusBadge'
 import { ReviewStatusBadge } from '@/components/reviews/ReviewStatusBadge'
 import { PRDiffViewer } from '@/components/pull_requests/PRDiffViewer'
@@ -44,6 +45,8 @@ export default function PullRequestDetailsPage() {
 
   const [selectedFilename, setSelectedFilename] = useState<string | null>(null)
   const [fileSearch, setFileSearch] = useState<string>('')
+  const [activeReviewId, setActiveReviewId] = useState<string | null>(null)
+  const [isFilePanelOpen, setIsFilePanelOpen] = useState(true)
   const [isReviewModalOpen, setIsReviewModalOpen] = useState(false)
   const [focusLine, setFocusLine] = useState<number | null>(null)
 
@@ -111,18 +114,60 @@ export default function PullRequestDetailsPage() {
   // Review PR mutation
   const reviewMutation = useMutation({
     mutationFn: () => reviewProjectPullRequest(projectId || '', prNum),
-    onSuccess: () => {
+    onSuccess: (result) => {
+      setActiveReviewId(result.review_id)
       queryClient.invalidateQueries({ queryKey: ['pullRequestReviews', projectId, prNum] })
       queryClient.invalidateQueries({ queryKey: ['projectReviews', projectId] })
       queryClient.invalidateQueries({ queryKey: ['pullRequests', projectId] })
-      toast.success('AI review completed and saved to history!')
+      toast.success('AI review queued. It will start when a worker is available.')
     },
     onError: (err: Error) => {
       toast.error(`Review failed: ${err.message}`)
     },
   })
 
+  const reviewJobQuery = useQuery<ReviewDetail>({
+    queryKey: ['reviewDetail', projectId, activeReviewId],
+    queryFn: () => getReviewById(projectId || '', activeReviewId || ''),
+    enabled: !!projectId && !!activeReviewId,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status === 'QUEUED' || status === 'RUNNING' ? 2000 : false
+    },
+  })
+
+  const activeReview = reviewJobQuery.data
+  const reviewData = activeReview?.status === 'COMPLETED'
+    ? activeReview.review_result || null
+    : null
+  const jobStatus: 'QUEUED' | 'RUNNING' | undefined = activeReview?.status === 'QUEUED'
+    ? 'QUEUED'
+    : activeReview?.status === 'RUNNING'
+    ? 'RUNNING'
+    : undefined
+  const reviewError = reviewMutation.error || reviewJobQuery.error || (
+    activeReview?.status === 'FAILED'
+      ? new Error(activeReview.error_message || 'The queued review failed.')
+      : null
+  )
+  const isReviewLoading = reviewMutation.isPending || reviewJobQuery.isLoading || Boolean(jobStatus)
+
+  React.useEffect(() => {
+    if (activeReview?.status === 'COMPLETED') {
+      queryClient.invalidateQueries({ queryKey: ['pullRequestReviews', projectId, prNum] })
+      queryClient.invalidateQueries({ queryKey: ['projectReviews', projectId] })
+      queryClient.invalidateQueries({ queryKey: ['pullRequests', projectId] })
+      toast.success('AI review completed and saved to history!')
+    } else if (activeReview?.status === 'FAILED') {
+      queryClient.invalidateQueries({ queryKey: ['pullRequestReviews', projectId, prNum] })
+      queryClient.invalidateQueries({ queryKey: ['projectReviews', projectId] })
+      toast.error(activeReview.error_message || 'AI review failed.')
+    }
+  }, [activeReview?.id, activeReview?.status, activeReview?.error_message, projectId, prNum, queryClient])
+
   const handleStartReview = () => {
+    setActiveReviewId(null)
+    reviewMutation.reset()
     reviewMutation.mutate()
   }
 
@@ -142,8 +187,8 @@ export default function PullRequestDetailsPage() {
 
   // Extract issue lines for current selected file if review data is available
   const issueLinesForSelectedFile: number[] = []
-  if (reviewMutation.data?.reviews) {
-    const fileReview = reviewMutation.data.reviews.find(
+  if (reviewData?.reviews) {
+    const fileReview = reviewData.reviews.find(
       (r) => r.filename === selectedFilename
     )
     if (fileReview?.review?.issues) {
@@ -425,9 +470,13 @@ export default function PullRequestDetailsPage() {
       )}
 
       {/* Main Diff & Files Split Layout */}
-      <div className="grid grid-cols-1 lg:grid-cols-4 gap-6 items-start">
+      <div className={`grid grid-cols-1 gap-6 items-start ${isFilePanelOpen ? 'lg:grid-cols-4' : ''}`}>
         {/* Left Column: Changed Files List */}
-        <div className="rounded-xl border border-zinc-850 bg-zinc-950/70 p-4 space-y-3 lg:sticky lg:top-4 text-left">
+        <div
+          id="pr-changed-files-panel"
+          hidden={!isFilePanelOpen}
+          className="rounded-xl border border-zinc-850 bg-zinc-950/70 p-4 space-y-3 lg:sticky lg:top-4 text-left"
+        >
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-1.5">
               <FileCode className="h-3.5 w-3.5 text-indigo-400" />
@@ -501,13 +550,15 @@ export default function PullRequestDetailsPage() {
         </div>
 
         {/* Right Column: Monaco PR Diff Viewer */}
-        <div className="lg:col-span-3">
+        <div className={isFilePanelOpen ? 'lg:col-span-3' : ''}>
           <PRDiffViewer
             file={selectedFile}
             rawDiff={diffData?.raw_diff}
             isLoading={isFilesLoading || isDiffLoading}
             issueLines={issueLinesForSelectedFile}
             focusLine={focusLine}
+            isFilePanelOpen={isFilePanelOpen}
+            onToggleFilePanel={() => setIsFilePanelOpen((open) => !open)}
           />
         </div>
       </div>
@@ -518,9 +569,10 @@ export default function PullRequestDetailsPage() {
         onClose={() => setIsReviewModalOpen(false)}
         prNumber={pr.number}
         prTitle={pr.title}
-        isLoading={reviewMutation.isPending}
-        reviewData={reviewMutation.data || null}
-        error={reviewMutation.error}
+        isLoading={isReviewLoading}
+        jobStatus={jobStatus}
+        reviewData={reviewData}
+        error={reviewError}
         onStartReview={handleStartReview}
         onSelectIssueLine={handleSelectIssueLine}
       />

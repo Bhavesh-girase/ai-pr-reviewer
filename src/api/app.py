@@ -1,10 +1,13 @@
+import asyncio
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from src.config import CORS_ALLOWED_ORIGINS, ENABLE_API_DOCS
+from src.config import CORS_ALLOWED_ORIGINS, ENABLE_API_DOCS, REVIEW_QUEUE_WORKER_ENABLED
 from src.api.routes import router
 from src.api.settings_routes import settings_router
 from src.api.project_routes import router as project_router
@@ -13,6 +16,20 @@ from src.api.webhook_routes import router as webhook_router
 
 from src.api.review_routes import router as review_router
 from src.api.insights_routes import router as insights_router
+from src.services.review_queue_worker import ReviewQueueWorker
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    worker = ReviewQueueWorker() if REVIEW_QUEUE_WORKER_ENABLED else None
+    worker_task = asyncio.create_task(worker.run()) if worker else None
+    app.state.review_queue_worker = worker
+    try:
+        yield
+    finally:
+        if worker and worker_task:
+            worker.stop()
+            await worker_task
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next) -> Response:
@@ -27,6 +44,7 @@ app = FastAPI(
     title="AI PR REVIEWER",
     version="1.0.0", 
     description="AI-powered pull request reviewer using the hybrid RAG",
+    lifespan=lifespan,
     docs_url="/docs" if ENABLE_API_DOCS else None,
     redoc_url="/redoc" if ENABLE_API_DOCS else None,
     openapi_url="/openapi.json" if ENABLE_API_DOCS else None,
@@ -51,8 +69,3 @@ app.include_router(pull_request_router)
 app.include_router(webhook_router)
 app.include_router(review_router)
 app.include_router(insights_router)
-
-
-
-
-    

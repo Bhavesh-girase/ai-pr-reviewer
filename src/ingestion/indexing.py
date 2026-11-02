@@ -10,9 +10,13 @@ from src.ingestion.data_utils import save_chunks
 from pathlib import Path
 from src.ingestion.data_utils  import get_chroma_directory
 
-def build_repository_index(repository_path: str):
+def build_repository_index(
+    repository_path: str,
+    persist_directory: str | Path | None = None,
+    repository_name: str | None = None,
+):
     """ Build a chroma index for an entire repository"""
-    repo_name=Path(repository_path).name
+    repo_name = repository_name or Path(repository_path).name
     
 
     documents=load_repository(repository_path)
@@ -24,7 +28,10 @@ def build_repository_index(repository_path: str):
     print(f"Chunks:{len(chunks)}")
 
 
-    save_chunks(chunks,repo_name)
+    # Keep the legacy pickle cache for notebook/standalone callers. Project
+    # indexes read their BM25 corpus from their own Chroma collection instead.
+    if persist_directory is None:
+        save_chunks(chunks, repo_name)
 
     # extracting the chunk ids 
     chunk_ids=[chunk.metadata["chunk_id"] for chunk in chunks if "chunk_id" in chunk.metadata]
@@ -37,20 +44,11 @@ def build_repository_index(repository_path: str):
 
     vectorstore=Chroma(
         embedding_function=embedding_function,
-        persist_directory=str(
-            get_chroma_directory(
-                repo_name
-            )
-        ),
+        persist_directory=str(persist_directory or get_chroma_directory(repo_name)),
     )
-    vectorstore.add_documents(
-        documents=chunks,
-        ids=chunk_ids,
-    )
-    
+    if chunks:
+        vectorstore.add_documents(documents=chunks, ids=chunk_ids)
 
     return vectorstore
 
  
-
-    

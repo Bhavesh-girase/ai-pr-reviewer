@@ -5,7 +5,6 @@ from fastapi import HTTPException, status
 
 from src.api.auth import get_supabase_client
 from src.github.github_client import GitHubClient
-from src.utils.security import encryption_service
 from src.services.project_service import project_service
 from src.services.github_credentials_service import github_credentials_service
 from src.pr_reviewer import PRReviewer
@@ -41,14 +40,11 @@ class PullRequestService:
                 detail=f"Project with ID '{project_id}' not found."
             )
 
-        auth_type = project.get("auth_type", "connected_account")
-        custom_token = project.get("custom_token")
-
-        token = None
-        if auth_type == "custom_token" and custom_token:
-            token = encryption_service.decrypt_or_passthrough(custom_token.strip())
-        else:
-            token = github_credentials_service.get_decrypted_pat(user_id, user_token)
+        token = github_credentials_service.resolve_project_token(
+            project,
+            user_id,
+            user_token,
+        )
 
         return project, token
 
@@ -85,6 +81,27 @@ class PullRequestService:
                 query = query.eq("state", "MERGED")
             elif state_lower == "draft":
                 query = query.eq("draft", True)
+
+            if search and search.strip():
+                search_value = search.strip()
+                escaped_search = (
+                    search_value
+                    .replace("\\", "\\\\")
+                    .replace("%", r"\%")
+                    .replace("_", r"\_")
+                    .replace('"', '\\"')
+                )
+                pattern = f'"%{escaped_search}%"'
+                search_filters = [
+                    f"title.ilike.{pattern}",
+                    f"author_login.ilike.{pattern}",
+                    f"source_branch.ilike.{pattern}",
+                    f"target_branch.ilike.{pattern}",
+                ]
+                number_query = search_value.removeprefix("#")
+                if number_query.isdigit():
+                    search_filters.append(f"github_pr_number.eq.{int(number_query)}")
+                query = query.or_(",".join(search_filters))
 
             order_col = "updated_at" if sort == "updated" else "created_at"
             desc_order = (direction.lower() == "desc")
@@ -160,15 +177,25 @@ class PullRequestService:
         state_lower = state.lower()
         gh_state = "all" if state_lower in ["all", "merged"] else ("closed" if state_lower == "closed" else "open")
 
-        gh_prs = client.list_pull_requests(
-            owner=owner,
-            repository=repo,
-            state=gh_state,
-            page=page,
-            per_page=per_page if not search and state_lower not in ["merged", "draft"] else 100,
-            sort=sort,
-            direction=direction,
-        )
+        needs_client_side_filter = bool(search and search.strip()) or state_lower in ["merged", "draft"]
+        if needs_client_side_filter:
+            gh_prs = client.list_all_pull_requests(
+                owner=owner,
+                repository=repo,
+                state=gh_state,
+                sort=sort,
+                direction=direction,
+            )
+        else:
+            gh_prs = client.list_pull_requests(
+                owner=owner,
+                repository=repo,
+                state=gh_state,
+                page=page,
+                per_page=per_page,
+                sort=sort,
+                direction=direction,
+            )
 
         items = []
         for pr in gh_prs:
@@ -385,22 +412,14 @@ class PullRequestService:
         user_token: str,
     ) -> Dict[str, Any]:
         """
-        Executes the AI review pipeline and persists the immutable Review record.
-        Maintains 100% backwards compatibility with existing UI responses.
+        Enqueues an AI review and returns its status record immediately.
         """
         from src.services.review_service import review_service
-        persisted_review = await review_service.create_and_execute_review(
+        return await review_service.enqueue_review(
             project_id=project_id,
             pr_number=pr_number,
             user_id=user_id,
             user_token=user_token
         )
-        
-        # Merge top-level reviews & metadata for frontend backward compatibility
-        result_payload = dict(persisted_review.get("review_result", {}))
-        result_payload["review_id"] = persisted_review["id"]
-        result_payload["review"] = persisted_review
-        return result_payload
 
 pull_request_service = PullRequestService()
-

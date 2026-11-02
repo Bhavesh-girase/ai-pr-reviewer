@@ -22,7 +22,11 @@ def update_repository(local_path: Path, token: Optional[str] = None) -> Path:
     """
     repo = Repo(local_path)
     if token:
-        repo.git.pull(c=f"http.extraHeader=Authorization: Bearer {token}")
+        repo.git.set_persistent_git_options(c=f"http.extraHeader=Authorization: Bearer {token}")
+        try:
+            repo.git.pull()
+        finally:
+            repo.git.set_persistent_git_options()
     else:
         repo.git.pull()
     return local_path

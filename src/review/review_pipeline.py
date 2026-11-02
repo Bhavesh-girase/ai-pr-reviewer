@@ -2,6 +2,8 @@ from src.review.prompts import REVIEW_PROMPT, format_context
 from src.review.schemas import ReviewResult
 from src.retrieval.retrieval_pipeline import RetrievalPipeline
 from src.config import llm
+from src.security.rate_limiter import llm_request_rate_limiter
+from pathlib import Path
 
 MAX_DIFF_LINES_PER_FILE = 500
 MAX_DIFF_CHARS_PER_FILE = 15000
@@ -43,8 +45,8 @@ def format_lines_with_limit(
 
 class ReviewPipeline:
 
-    def __init__(self, repository_name: str):
-        self.retriever = RetrievalPipeline(repository_name)
+    def __init__(self, repository_name: str, persist_directory: str | Path | None = None):
+        self.retriever = RetrievalPipeline(repository_name, persist_directory=persist_directory)
         self.llm = llm
         self.structured_llm = llm.with_structured_output(ReviewResult)
         self.chain = REVIEW_PROMPT | self.structured_llm
@@ -63,6 +65,7 @@ class ReviewPipeline:
         added_code_str = format_lines_with_limit(file_change.get("added_lines", []))
         removed_code_str = format_lines_with_limit(file_change.get("removed_lines", []))
 
+        llm_request_rate_limiter.wait_for_slot()
         review = self.chain.invoke(
             {
                 "context": context,
@@ -101,4 +104,3 @@ class ReviewPipeline:
                 }
             )
         return reviews, total_chunks
-        

@@ -1,6 +1,7 @@
 import logging
 from typing import List, Dict, Any
 from fastapi import APIRouter, Depends, status, HTTPException
+from starlette.concurrency import run_in_threadpool
 from src.api.auth import get_current_user
 from src.schemas.project import (
     ProjectCreateSchema,
@@ -22,7 +23,11 @@ async def list_projects(current_user: Dict[str, Any] = Depends(get_current_user)
     Returns all provisioned projects belonging to the authenticated user.
     Uses Supabase RLS via user JWT token.
     """
-    return project_service.get_user_projects(current_user["id"], current_user["token"])
+    return await run_in_threadpool(
+        project_service.get_user_projects,
+        current_user["id"],
+        current_user["token"],
+    )
 
 @router.get("/{project_id}", response_model=ProjectResponseSchema)
 async def get_project(
@@ -32,7 +37,13 @@ async def get_project(
     """
     Retrieves project details by UUID for the authenticated user.
     """
-    return project_service.get_project_by_id(project_id, current_user["id"], current_user["token"], sanitize=True)
+    return await run_in_threadpool(
+        project_service.get_project_by_id,
+        project_id,
+        current_user["id"],
+        current_user["token"],
+        sanitize=True,
+    )
 
 @router.post("", response_model=ProjectResponseSchema, status_code=status.HTTP_201_CREATED)
 async def create_project(
@@ -77,10 +88,11 @@ async def delete_project(
     """
     Deletes project record from database and recursively removes local repository and Chroma storage.
     """
-    return project_service.delete_project(
+    return await run_in_threadpool(
+        project_service.delete_project,
         project_id=project_id,
         user_id=current_user["id"],
-        user_token=current_user["token"]
+        user_token=current_user["token"],
     )
 
 @router.post("/{project_id}/sync", response_model=ProjectSyncResponseSchema)
@@ -107,8 +119,9 @@ async def get_project_sync_status(
     """
     Retrieves real-time synchronization status and timestamps for a project.
     """
-    return repository_sync_service.get_sync_status(
+    return await run_in_threadpool(
+        repository_sync_service.get_sync_status,
         project_id=project_id,
         user_id=current_user["id"],
-        user_token=current_user["token"]
+        user_token=current_user["token"],
     )

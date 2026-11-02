@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from fastapi import HTTPException, status
 from git import Repo
+from starlette.concurrency import run_in_threadpool
 
 from src.api.auth import get_supabase_client
 from src.utils.security import encryption_service, sanitize_error_message
@@ -53,14 +54,11 @@ class RepositorySyncService:
 
         target_user_id = user_id or project["user_id"]
 
-        auth_type = project.get("auth_type", "connected_account")
-        custom_token = project.get("custom_token")
-
-        token = None
-        if auth_type == "custom_token" and custom_token:
-            token = encryption_service.decrypt_or_passthrough(custom_token.strip())
-        else:
-            token = github_credentials_service.get_decrypted_pat(target_user_id, user_token)
+        token = github_credentials_service.resolve_project_token(
+            project,
+            target_user_id,
+            user_token,
+        )
 
         return project, token
 
@@ -113,6 +111,92 @@ class RepositorySyncService:
 
         return added_files, modified_files, deleted_files, renamed_files
 
+    def _synchronize_checkout_and_index(
+        self,
+        project_id: str,
+        project: Dict[str, Any],
+        token: Optional[str],
+        repo_name: str,
+        branch: str,
+        repo_path: Path,
+        chroma_path: Path,
+        target_commit: Optional[str],
+        base_commit: Optional[str],
+    ) -> Tuple[str, int, bool]:
+        """Run all blocking Git, filesystem, and Chroma work in one worker."""
+        owner = project["github_owner"]
+        clean_url = f"https://github.com/{owner}/{repo_name}.git"
+
+        if not (repo_path / ".git").exists():
+            logger.info(f"Cloning missing repository workspace for project {project_id}")
+            c_opts = [f"http.extraHeader=Authorization: Bearer {token}"] if token else None
+            Repo.clone_from(clean_url, repo_path, c=c_opts)
+
+        git_repo = Repo(repo_path)
+
+        # Ensure origin URL is clean without credentials in .git/config.
+        if "origin" in [remote.name for remote in git_repo.remotes]:
+            git_repo.remotes.origin.set_url(clean_url)
+        else:
+            git_repo.create_remote("origin", clean_url)
+
+        logger.info(f"Fetching latest changes for {owner}/{repo_name} (branch: {branch})")
+        if token:
+            git_repo.git.set_persistent_git_options(c=f"http.extraHeader=Authorization: Bearer {token}")
+            try:
+                git_repo.git.fetch("origin", branch)
+            finally:
+                git_repo.git.set_persistent_git_options()
+        else:
+            git_repo.git.fetch("origin", branch)
+
+        old_commit = (
+            base_commit
+            or project.get("current_commit_hash")
+            or str(git_repo.head.commit.hexsha)
+        )
+        remote_ref = git_repo.remotes.origin.refs[branch]
+        new_commit = target_commit or str(remote_ref.commit.hexsha)
+
+        logger.info(f"Project {project_id} sync commits: {old_commit[:7]} -> {new_commit[:7]}")
+
+        if old_commit == new_commit and project.get("current_commit_hash") == new_commit:
+            logger.info(f"Project {project_id} repository already up-to-date at commit {new_commit[:7]}")
+            return new_commit, 0, True
+
+        added, modified, deleted, renamed = self._detect_git_changes(repo_path, old_commit, new_commit)
+        total_changes = len(added) + len(modified) + len(deleted) + len(renamed)
+
+        git_repo.git.checkout(branch)
+        git_repo.git.reset("--hard", f"origin/{branch}")
+
+        indexer = IncrementalIndexer(
+            repository_name=repo_name,
+            persist_directory=str(chroma_path),
+        )
+
+        if total_changes > 0:
+            logger.info(f"Applying incremental index updates ({total_changes} files)")
+            indexer.sync_changes(
+                repository_path=str(repo_path),
+                added_files=added,
+                modified_files=modified,
+                deleted_files=deleted,
+                renamed_files=renamed,
+            )
+        else:
+            # Fallback if diff was empty but commit changed: re-index full repository safely.
+            from src.github.repository_loader import load_repository
+            from src.ingestion.code_chunker import chunk_documents
+
+            docs = load_repository(str(repo_path))
+            chunks = chunk_documents(docs, repository_name=repo_name)
+            chunk_ids = [c.metadata["chunk_id"] for c in chunks if "chunk_id" in c.metadata]
+            if chunks:
+                indexer.vectorstore.add_documents(documents=chunks, ids=chunk_ids)
+
+        return new_commit, total_changes, False
+
     async def sync_project_repository(
         self,
         project_id: str,
@@ -129,75 +213,62 @@ class RepositorySyncService:
 
         async with lock:
             start_time = time.time()
-            supabase = get_supabase_client(user_token)
+            supabase = await run_in_threadpool(get_supabase_client, user_token)
 
             # Step 1: Mark sync_status = SYNCING
             now_iso = datetime.now(timezone.utc).isoformat()
-            supabase.table("projects").update({
-                "sync_status": "SYNCING",
-                "last_sync_started_at": now_iso,
-                "sync_error_message": None
-            }).eq("id", project_id).execute()
+            await run_in_threadpool(
+                lambda: supabase.table("projects").update({
+                    "sync_status": "SYNCING",
+                    "last_sync_started_at": now_iso,
+                    "sync_error_message": None
+                }).eq("id", project_id).execute()
+            )
 
             try:
                 # Step 2: Resolve Project and Token
-                project, token = self._resolve_project_and_token(project_id, user_id, user_token)
+                project, token = await run_in_threadpool(
+                    self._resolve_project_and_token,
+                    project_id,
+                    user_id,
+                    user_token,
+                )
                 owner = project["github_owner"]
                 repo_name = project["github_repository"]
                 branch = project.get("default_branch") or "main"
                 user_uuid = project["user_id"]
 
-                repo_dir, chroma_dir = project_storage.ensure_project_directories(user_uuid, project_id)
+                repo_dir, chroma_dir = await run_in_threadpool(
+                    project_storage.ensure_project_directories,
+                    user_uuid,
+                    project_id,
+                )
                 repo_path = Path(project.get("clone_path") or str(repo_dir))
                 chroma_path = Path(project.get("chroma_path") or str(chroma_dir))
 
-                # Step 3: Ensure local clone exists with clean URL (no credentials in .git/config)
-                clean_url = f"https://github.com/{owner}/{repo_name}.git"
-
-                if not (repo_path / ".git").exists():
-                    logger.info(f"Cloning missing repository workspace for project {project_id}")
-                    c_opts = [f"http.extraHeader=Authorization: Bearer {token}"] if token else None
-                    Repo.clone_from(clean_url, repo_path, c=c_opts)
-
-                git_repo = Repo(repo_path)
-
-                # Ensure origin URL is clean without credentials in .git/config
-                if "origin" in [remote.name for remote in git_repo.remotes]:
-                    git_repo.remotes.origin.set_url(clean_url)
-                else:
-                    git_repo.create_remote("origin", clean_url)
-
-                # Step 4: Fetch remote branch with ephemeral auth header
-                logger.info(f"Fetching latest changes for {owner}/{repo_name} (branch: {branch})")
-                if token:
-                    git_repo.git.fetch("origin", branch, c=f"http.extraHeader=Authorization: Bearer {token}")
-                else:
-                    git_repo.git.fetch("origin", branch)
-
-                # Step 5: Determine old and new commit hashes
-                old_commit = (
-                    base_commit
-                    or project.get("current_commit_hash")
-                    or str(git_repo.head.commit.hexsha)
+                new_commit, total_changes, already_up_to_date = await run_in_threadpool(
+                    self._synchronize_checkout_and_index,
+                    project_id,
+                    project,
+                    token,
+                    repo_name,
+                    branch,
+                    repo_path,
+                    chroma_path,
+                    target_commit,
+                    base_commit,
                 )
 
-                # Remote latest commit
-                remote_ref = git_repo.remotes.origin.refs[branch]
-                new_commit = target_commit or str(remote_ref.commit.hexsha)
-
-                logger.info(f"Project {project_id} sync commits: {old_commit[:7]} -> {new_commit[:7]}")
-
-                # If commit hash is identical, repository is already synchronized
-                if old_commit == new_commit and project.get("current_commit_hash") == new_commit:
-                    logger.info(f"Project {project_id} repository already up-to-date at commit {new_commit[:7]}")
+                if already_up_to_date:
                     now_done = datetime.now(timezone.utc).isoformat()
-                    supabase.table("projects").update({
-                        "sync_status": "READY",
-                        "last_synced_at": now_done,
-                        "last_sync_completed_at": now_done,
-                        "sync_error_message": None
-                    }).eq("id", project_id).execute()
-
+                    await run_in_threadpool(
+                        lambda: supabase.table("projects").update({
+                            "sync_status": "READY",
+                            "last_synced_at": now_done,
+                            "last_sync_completed_at": now_done,
+                            "sync_error_message": None
+                        }).eq("id", project_id).execute()
+                    )
                     return {
                         "status": "READY",
                         "current_commit": new_commit,
@@ -206,39 +277,6 @@ class RepositorySyncService:
                         "changed_files_count": 0,
                         "message": "Repository is already synchronized with latest commit."
                     }
-
-                # Step 6: Detect changed files between commits
-                added, modified, deleted, renamed = self._detect_git_changes(repo_path, old_commit, new_commit)
-                total_changes = len(added) + len(modified) + len(deleted) + len(renamed)
-
-                # Step 7: Update local working tree to new commit
-                git_repo.git.checkout(branch)
-                git_repo.git.reset("--hard", f"origin/{branch}")
-
-                # Step 8: Trigger Incremental Indexer on ChromaDB
-                indexer = IncrementalIndexer(
-                    repository_name=repo_name,
-                    persist_directory=str(chroma_path)
-                )
-
-                if total_changes > 0:
-                    logger.info(f"Applying incremental index updates ({total_changes} files)")
-                    indexer.sync_changes(
-                        repository_path=str(repo_path),
-                        added_files=added,
-                        modified_files=modified,
-                        deleted_files=deleted,
-                        renamed_files=renamed
-                    )
-                else:
-                    # Fallback if diff was empty but commit changed: re-index full repository safely
-                    from src.github.repository_loader import load_repository
-                    from src.ingestion.code_chunker import chunk_documents
-                    docs = load_repository(str(repo_path))
-                    chunks = chunk_documents(docs, repository_name=repo_name)
-                    chunk_ids = [c.metadata["chunk_id"] for c in chunks if "chunk_id" in c.metadata]
-                    if chunks:
-                        indexer.vectorstore.add_documents(documents=chunks, ids=chunk_ids)
 
                 # Step 9: Atomically update database metadata to READY
                 now_completed = datetime.now(timezone.utc).isoformat()
@@ -252,7 +290,9 @@ class RepositorySyncService:
                     "sync_error_message": None,
                     "error_message": None
                 }
-                supabase.table("projects").update(final_update).eq("id", project_id).execute()
+                await run_in_threadpool(
+                    lambda: supabase.table("projects").update(final_update).eq("id", project_id).execute()
+                )
 
                 duration = round(time.time() - start_time, 2)
                 logger.info(
@@ -279,11 +319,13 @@ class RepositorySyncService:
                 # Rollback: Mark sync_status = SYNC_FAILED, keep previous commit intact
                 now_failed = datetime.now(timezone.utc).isoformat()
                 try:
-                    supabase.table("projects").update({
-                        "sync_status": "SYNC_FAILED",
-                        "sync_error_message": sanitized_err,
-                        "last_sync_completed_at": now_failed
-                    }).eq("id", project_id).execute()
+                    await run_in_threadpool(
+                        lambda: supabase.table("projects").update({
+                            "sync_status": "SYNC_FAILED",
+                            "sync_error_message": sanitized_err,
+                            "last_sync_completed_at": now_failed
+                        }).eq("id", project_id).execute()
+                    )
                 except Exception:
                     pass
 

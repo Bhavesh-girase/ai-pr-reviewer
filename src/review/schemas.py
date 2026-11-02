@@ -5,6 +5,7 @@ class Severity(str,Enum):
     LOW="LOW"
     MEDIUM="MEDIUM"
     HIGH="HIGH"
+    CRITICAL="CRITICAL"
 
 class Category(str,Enum):
     BUG="Bug"
@@ -26,4 +27,3 @@ class ReviewIssue(BaseModel):
 class ReviewResult(BaseModel):
     summary:str
     issues:list[ReviewIssue]=Field(default_factory=list)
-    

@@ -33,6 +33,8 @@ data/processed/
 data/repositories/
 data/metadata/
 data/docs/
+data/storage/
+data/huggingface/
 
 # Jupyter generated checkpoints
 .ipynb_checkpoints/

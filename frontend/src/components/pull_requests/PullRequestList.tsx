@@ -2,7 +2,8 @@ import React, { useState } from 'react'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import type { Project } from '@/types/project'
 import type { PullRequest } from '@/types/pullRequest'
-import { getPullRequests, reviewProjectPullRequest } from '@/api/pullRequests'
+import { getPullRequests } from '@/api/pullRequests'
+import { getReviewById, reviewProjectPullRequest } from '@/api/reviews'
 import { PullRequestCard } from './PullRequestCard'
 import { PullRequestFilterBar } from './PullRequestFilterBar'
 import { PullRequestListSkeleton } from './PullRequestListSkeleton'
@@ -51,24 +52,64 @@ export const PullRequestList: React.FC<PullRequestListProps> = ({ project }) => 
   // Review PR mutation
   const reviewMutation = useMutation({
     mutationFn: (prNumber: number) => reviewProjectPullRequest(project.id, prNumber),
-    onSuccess: () => {
-      toast.success('AI Review completed successfully!')
+    onSuccess: (result) => {
+      setActiveReviewId(result.review_id)
+      toast.success('AI review queued. It will start when a worker is available.')
     },
     onError: (err: Error) => {
       toast.error(`Review failed: ${err.message}`)
     },
   })
 
+  const [activeReviewId, setActiveReviewId] = useState<string | null>(null)
+  const reviewJobQuery = useQuery({
+    queryKey: ['reviewDetail', project.id, activeReviewId],
+    queryFn: () => getReviewById(project.id, activeReviewId || ''),
+    enabled: !!activeReviewId,
+    refetchInterval: (query) => {
+      const status = query.state.data?.status
+      return status === 'QUEUED' || status === 'RUNNING' ? 2000 : false
+    },
+  })
+
   const handleOpenReviewModal = (pr: PullRequest) => {
+    reviewMutation.reset()
+    setActiveReviewId(null)
     setReviewingPr(pr)
     setIsReviewModalOpen(true)
   }
 
   const handleStartReview = () => {
     if (reviewingPr) {
+      reviewMutation.reset()
+      setActiveReviewId(null)
       reviewMutation.mutate(reviewingPr.number)
     }
   }
+
+  const activeReview = reviewJobQuery.data
+  const reviewData = activeReview?.status === 'COMPLETED'
+    ? activeReview.review_result || null
+    : null
+  const jobStatus: 'QUEUED' | 'RUNNING' | undefined = activeReview?.status === 'QUEUED'
+    ? 'QUEUED'
+    : activeReview?.status === 'RUNNING'
+    ? 'RUNNING'
+    : undefined
+  const reviewError = reviewMutation.error || reviewJobQuery.error || (
+    activeReview?.status === 'FAILED'
+      ? new Error(activeReview.error_message || 'The queued review failed.')
+      : null
+  )
+  const isReviewLoading = reviewMutation.isPending || reviewJobQuery.isLoading || Boolean(jobStatus)
+
+  React.useEffect(() => {
+    if (activeReview?.status === 'COMPLETED') {
+      toast.success('AI review completed successfully!')
+    } else if (activeReview?.status === 'FAILED') {
+      toast.error(activeReview.error_message || 'AI review failed.')
+    }
+  }, [activeReview?.id, activeReview?.status, activeReview?.error_message])
 
   const handleStateChange = (state: 'all' | 'open' | 'closed' | 'merged' | 'draft') => {
     setSelectedState(state)
@@ -208,9 +249,10 @@ export const PullRequestList: React.FC<PullRequestListProps> = ({ project }) => 
           onClose={() => setIsReviewModalOpen(false)}
           prNumber={reviewingPr.number}
           prTitle={reviewingPr.title}
-          isLoading={reviewMutation.isPending}
-          reviewData={reviewMutation.data || null}
-          error={reviewMutation.error}
+          isLoading={isReviewLoading}
+          jobStatus={jobStatus}
+          reviewData={reviewData}
+          error={reviewError}
           onStartReview={handleStartReview}
         />
       )}

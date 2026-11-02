@@ -115,12 +115,10 @@ export const ReviewCard: React.FC<ReviewCardProps> = ({ review, projectId }) => 
         )}
 
         {/* Model */}
-        {review.model_name && (
-          <div className="flex items-center gap-1 text-[11px] text-zinc-400">
-            <Bot className="h-3.5 w-3.5 text-indigo-400" />
-            <span>{review.model_name}</span>
-          </div>
-        )}
+        <div className="flex items-center gap-1 text-[11px] text-zinc-400">
+          <Bot className="h-3.5 w-3.5 text-indigo-400" />
+          <span>AI</span>
+        </div>
 
         {/* Commit Hash */}
         {review.head_commit_sha && (

@@ -4,7 +4,7 @@ import type {
   ReviewDetail,
   ReviewListResponse,
   ReviewFilterParams,
-  ReviewApiResponse,
+  ReviewQueueResponse,
 } from '@/types/review'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
@@ -100,7 +100,7 @@ export async function getPullRequestReviews(
 export async function reviewProjectPullRequest(
   projectId: string,
   prNumber: number
-): Promise<ReviewApiResponse & { review_id?: string; review?: ReviewItem }> {
+): Promise<ReviewQueueResponse> {
   const headers = await getAuthHeader()
   const response = await fetch(`${API_BASE_URL}/projects/${projectId}/pull-requests/${prNumber}/review`, {
     method: 'POST',

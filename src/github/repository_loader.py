@@ -106,7 +106,7 @@ def load_file(
             "file_name": file_path.name,
             "extension": file_path.suffix,
             "language": get_language(file_path),
-            "relative_path": str(relative_path),
+            "relative_path": relative_path.as_posix(),
             "repository": repository_name,
         },
     )
@@ -142,4 +142,3 @@ def load_repository(repo_path: str) -> list[Document]:
             documents.append(document)
 
     return documents
-                

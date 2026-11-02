@@ -121,6 +121,32 @@ class GitHubClient:
                 detail="GitHub API service is currently unreachable."
             )
 
+    def list_all_pull_requests(
+        self,
+        owner: str,
+        repository: str,
+        state: str = "open",
+        sort: str = "created",
+        direction: str = "desc",
+    ) -> List[Dict[str, Any]]:
+        """Fetch every page of PRs for full synchronization and local filtering."""
+        all_pull_requests: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            pull_requests = self.list_pull_requests(
+                owner=owner,
+                repository=repository,
+                state=state,
+                page=page,
+                per_page=100,
+                sort=sort,
+                direction=direction,
+            )
+            all_pull_requests.extend(pull_requests)
+            if len(pull_requests) < 100:
+                return all_pull_requests
+            page += 1
+
     def get_pull_request(self, owner: str, repository: str, pull_number: int) -> Dict[str, Any]:
         """Fetch single pull request details"""
         url = f"{self.BASE_URL}/repos/{owner}/{repository}/pulls/{pull_number}"
@@ -138,10 +164,21 @@ class GitHubClient:
     def get_pull_request_files(self, owner: str, repository: str, pull_number: int) -> List[Dict[str, Any]]:
         """Fetch all files changed in a pull request"""
         url = f"{self.BASE_URL}/repos/{owner}/{repository}/pulls/{pull_number}/files"
+        all_files: List[Dict[str, Any]] = []
+        page = 1
         try:
-            response = self.session.get(url, params={"per_page": 100}, timeout=20)
-            self._handle_response(response, f"get_pull_request_files {owner}/{repository} #{pull_number}")
-            return response.json()
+            while True:
+                response = self.session.get(
+                    url,
+                    params={"per_page": 100, "page": page},
+                    timeout=20,
+                )
+                self._handle_response(response, f"get_pull_request_files {owner}/{repository} #{pull_number}")
+                files = response.json()
+                all_files.extend(files)
+                if len(files) < 100:
+                    return all_files
+                page += 1
         except requests.exceptions.RequestException as e:
             logger.error(f"Network error fetching files for PR #{pull_number}: {str(e)}")
             raise HTTPException(
