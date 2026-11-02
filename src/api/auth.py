@@ -2,6 +2,7 @@ import logging
 from typing import Optional, Dict, Any
 from fastapi import HTTPException, Security, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from starlette.concurrency import run_in_threadpool
 from supabase import create_client, Client
 from src.config import SUPABASE_URL, SUPABASE_KEY
 from src.utils.security import sanitize_error_message
@@ -41,9 +42,9 @@ async def get_current_user(
         )
     
     try:
-        supabase = get_supabase_client()
+        supabase = await run_in_threadpool(get_supabase_client)
         # Verify JWT token with Supabase auth
-        user_response = supabase.auth.get_user(token)
+        user_response = await run_in_threadpool(supabase.auth.get_user, token)
         if not user_response or not user_response.user:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

@@ -2,6 +2,8 @@ import json
 import hmac
 import hashlib
 import asyncio
+from datetime import datetime, timezone, timedelta
+from types import SimpleNamespace
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 from fastapi import HTTPException
@@ -83,20 +85,44 @@ def test_webhook_missing_signature_raises_401(sample_payload):
 def test_webhook_replay_protection():
     async def run():
         service = WebhookService()
-        raw_body = json.dumps({"repository": {"name": "test-repo", "owner": {"login": "test-owner"}}}).encode("utf-8")
+        sample_secret = "test-secret-key-32-bytes-long-for-hmac!!"
+        payload = {
+            "repository": {"name": "test-repo", "owner": {"login": "test-owner"}},
+            "action": "opened",
+        }
+        raw_body = json.dumps(payload).encode("utf-8")
+        signature = hmac.new(sample_secret.encode(), raw_body, hashlib.sha256).hexdigest()
         headers = {
-            "x-hub-signature-256": "sha256=abcdef",
+            "x-hub-signature-256": f"sha256={signature}",
             "x-github-delivery": "deliv-existing-uuid",
             "x-github-event": "pull_request"
         }
 
         mock_supabase = MagicMock()
-        mock_supabase.table.return_value.select.return_value.eq.return_value.execute.return_value.data = [{"id": "deliv-1"}]
+        project = {
+            "id": "proj-1",
+            "github_owner": "test-owner",
+            "github_repository": "test-repo",
+            "webhook_secret_encrypted": encryption_service.encrypt(sample_secret),
+        }
+        existing_delivery = {
+            "id": "deliv-1",
+            "project_id": "proj-1",
+            "status": "PROCESSED",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        execute = AsyncMock(side_effect=[
+            SimpleNamespace(data=[project]),
+            RuntimeError("duplicate delivery id"),
+            SimpleNamespace(data=[existing_delivery]),
+        ])
 
-        with patch("src.services.webhook_service.get_supabase_client", return_value=mock_supabase):
+        with patch("src.services.webhook_service.get_supabase_client", return_value=mock_supabase), \
+             patch("src.services.webhook_service._execute", execute):
             result = await service.handle_webhook(raw_body, headers)
             assert result["status"] == "ignored"
             assert result["reason"] == "duplicate_delivery"
+            assert execute.await_count == 3
     asyncio.run(run())
 
 def test_webhook_opened_event_processing(sample_secret, sample_payload):
@@ -127,13 +153,149 @@ def test_webhook_opened_event_processing(sample_secret, sample_payload):
         # Insert delivery returns id
         mock_supabase.table.return_value.insert.return_value.execute.return_value.data = [{"id": "deliv-rec-1"}]
 
-        with patch("src.services.webhook_service.get_supabase_client", return_value=mock_supabase):
+        execute = AsyncMock(side_effect=[
+            SimpleNamespace(data=[mock_project]),
+            SimpleNamespace(data=[{"id": "deliv-rec-1"}]),
+            SimpleNamespace(data=[]),
+            SimpleNamespace(data=[]),
+        ])
+
+        with patch("src.services.webhook_service.get_supabase_client", return_value=mock_supabase), \
+             patch("src.services.webhook_service._execute", execute):
             with patch("src.services.pull_request_sync_service.pull_request_sync_service.sync_single_pull_request") as mock_sync:
                 result = await service.handle_webhook(raw_body, headers)
                 assert result["status"] == "processed"
                 assert result["action"] == "opened"
                 assert result["pr_number"] == 42
                 mock_sync.assert_called_once()
+    asyncio.run(run())
+
+
+def test_failed_webhook_delivery_is_claimed_for_retry():
+    async def run():
+        service = WebhookService()
+        supabase = MagicMock()
+        existing_delivery = {
+            "id": "delivery-1",
+            "project_id": "project-1",
+            "status": "FAILED",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        execute = AsyncMock(side_effect=[
+            RuntimeError("duplicate delivery id"),
+            SimpleNamespace(data=[existing_delivery]),
+            SimpleNamespace(data=[{"id": "delivery-1"}]),
+        ])
+
+        with patch("src.services.webhook_service._execute", execute):
+            record_id, claimed = await service._claim_delivery(
+                supabase=supabase,
+                project_id="project-1",
+                delivery_id="github-delivery-1",
+                event_type="pull_request",
+                action="opened",
+                received_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+        assert record_id == "delivery-1"
+        assert claimed is True
+        assert execute.await_count == 3
+
+    asyncio.run(run())
+
+
+def test_stale_processing_delivery_can_be_reclaimed():
+    async def run():
+        service = WebhookService()
+        supabase = MagicMock()
+        stale_received_at = datetime.now(timezone.utc) - timedelta(minutes=31)
+        existing_delivery = {
+            "id": "delivery-2",
+            "project_id": "project-1",
+            "status": "PROCESSING",
+            "received_at": stale_received_at.isoformat(),
+        }
+        execute = AsyncMock(side_effect=[
+            RuntimeError("duplicate delivery id"),
+            SimpleNamespace(data=[existing_delivery]),
+            SimpleNamespace(data=[{"id": "delivery-2"}]),
+        ])
+
+        with patch("src.services.webhook_service._execute", execute):
+            record_id, claimed = await service._claim_delivery(
+                supabase=supabase,
+                project_id="project-1",
+                delivery_id="github-delivery-2",
+                event_type="push",
+                action=None,
+                received_at=datetime.now(timezone.utc).isoformat(),
+            )
+
+        assert record_id == "delivery-2"
+        assert claimed is True
+        update_payload = supabase.table.return_value.update.call_args.args[0]
+        assert update_payload["status"] == "RETRYING"
+
+    asyncio.run(run())
+
+
+def test_active_webhook_delivery_is_retryable_not_processed_twice():
+    async def run():
+        service = WebhookService()
+        supabase = MagicMock()
+        existing_delivery = {
+            "id": "delivery-3",
+            "project_id": "project-1",
+            "status": "PROCESSING",
+            "received_at": datetime.now(timezone.utc).isoformat(),
+        }
+        execute = AsyncMock(side_effect=[
+            RuntimeError("duplicate delivery id"),
+            SimpleNamespace(data=[existing_delivery]),
+        ])
+
+        with patch("src.services.webhook_service._execute", execute):
+            with pytest.raises(HTTPException) as exc:
+                await service._claim_delivery(
+                    supabase=supabase,
+                    project_id="project-1",
+                    delivery_id="github-delivery-3",
+                    event_type="push",
+                    action=None,
+                    received_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+        assert exc.value.status_code == 503
+        assert exc.value.headers["Retry-After"] == "30"
+        assert execute.await_count == 2
+
+    asyncio.run(run())
+
+
+def test_delivery_record_failure_returns_retryable_503():
+    async def run():
+        service = WebhookService()
+        supabase = MagicMock()
+        execute = AsyncMock(side_effect=[
+            RuntimeError("database unavailable"),
+            SimpleNamespace(data=[]),
+        ])
+
+        with patch("src.services.webhook_service._execute", execute):
+            with pytest.raises(HTTPException) as exc:
+                await service._claim_delivery(
+                    supabase=supabase,
+                    project_id="project-1",
+                    delivery_id="github-delivery-unpersisted",
+                    event_type="push",
+                    action=None,
+                    received_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+        assert exc.value.status_code == 503
+        assert exc.value.headers["Retry-After"] == "30"
+        assert execute.await_count == 2
+
     asyncio.run(run())
 
 def test_pull_request_sync_service_upsert(sample_payload):

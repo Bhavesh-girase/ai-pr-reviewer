@@ -80,6 +80,12 @@ export interface ReviewApiResponse {
 
 export type ReviewResponse = ReviewApiResponse
 
+export interface ReviewQueueResponse {
+  review_id: string
+  status: 'QUEUED' | 'RUNNING'
+  created_at?: string | null
+}
+
 // Phase 6 Domain Entity: Persistent Review Models
 export interface ReviewItem {
   id: string

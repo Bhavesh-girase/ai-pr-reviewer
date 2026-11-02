@@ -1,6 +1,7 @@
 import logging
 from typing import Dict, Any, Optional
 from fastapi import APIRouter, Request, Depends, status, HTTPException
+from starlette.concurrency import run_in_threadpool
 from src.api.auth import get_current_user
 from src.schemas.webhook import (
     WebhookStatusResponseSchema,
@@ -33,7 +34,8 @@ async def get_project_webhook_status(
     """
     Retrieves safe webhook status metadata for a project.
     """
-    return webhook_registration_service.get_webhook_status(
+    return await run_in_threadpool(
+        webhook_registration_service.get_webhook_status,
         project_id=project_id,
         user_id=current_user["id"],
         user_token=current_user["token"],
@@ -90,7 +92,8 @@ async def manual_sync_project_pull_requests(
     """
     Manually triggers full Pull Request synchronization from GitHub REST API into PostgreSQL.
     """
-    count = pull_request_sync_service.sync_project_pull_requests(
+    count = await run_in_threadpool(
+        pull_request_sync_service.sync_project_pull_requests,
         project_id=project_id,
         user_id=current_user["id"],
         user_token=current_user["token"],

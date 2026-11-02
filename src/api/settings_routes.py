@@ -1,6 +1,7 @@
 import logging
 from typing import Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status
+from starlette.concurrency import run_in_threadpool
 from src.api.auth import get_current_user
 from src.schemas.github_settings import (
     GitHubTokenRequest,
@@ -26,7 +27,11 @@ async def get_github_integration_status(
     """
     user_id = current_user["id"]
     user_token = current_user.get("token")
-    cred = github_credentials_service.get_credential(user_id, user_token=user_token)
+    cred = await run_in_threadpool(
+        github_credentials_service.get_credential,
+        user_id,
+        user_token=user_token,
+    )
     
     if not cred:
         return GitHubStatusResponse(
@@ -84,5 +89,9 @@ async def disconnect_github_account(
     """
     user_id = current_user["id"]
     user_token = current_user.get("token")
-    res = github_credentials_service.delete_credential(user_id, user_token=user_token)
+    res = await run_in_threadpool(
+        github_credentials_service.delete_credential,
+        user_id,
+        user_token=user_token,
+    )
     return GitHubDisconnectResponse(**res)

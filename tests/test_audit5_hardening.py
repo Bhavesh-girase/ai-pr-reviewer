@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from src.api.app import app
 from src.schemas.project import ProjectCreateSchema, ProjectUpdateSchema
-from src.security.rate_limiter import RateLimiter, review_rate_limiter
+from src.security.rate_limiter import RateLimiter
 from src.config import CORS_ALLOWED_ORIGINS
 
 client = TestClient(app)
@@ -87,11 +87,7 @@ def test_rate_limiter_distinct_user_isolation():
 def test_review_endpoint_enforces_rate_limit():
     """Verify that POST /projects/{project_id}/pull-requests/{pr_number}/review triggers rate limiting."""
     from src.api.auth import get_current_user
-    review_rate_limiter.reset("test-rate-user")
-    
-    # Configure low limit for testing
-    original_limit = review_rate_limiter.max_requests
-    review_rate_limiter.max_requests = 2
+    local_limiter = RateLimiter(max_requests=2, window_seconds=60)
     
     user_auth = {
         "id": "test-rate-user",
@@ -102,16 +98,17 @@ def test_review_endpoint_enforces_rate_limit():
     
     app.dependency_overrides[get_current_user] = lambda: user_auth
     try:
-        with patch("src.api.pull_request_routes.pull_request_service.review_pull_request", new_callable=AsyncMock) as mock_review:
+        with patch("src.api.pull_request_routes.review_rate_limiter", local_limiter), \
+             patch("src.api.pull_request_routes.pull_request_service.review_pull_request", new_callable=AsyncMock) as mock_review:
             mock_review.return_value = {"status": "QUEUED", "review_id": "rev-1"}
             
             # Call 1: Success
             res1 = client.post("/projects/proj-123/pull-requests/10/review")
-            assert res1.status_code == 200
+            assert res1.status_code == 202
             
             # Call 2: Success
             res2 = client.post("/projects/proj-123/pull-requests/10/review")
-            assert res2.status_code == 200
+            assert res2.status_code == 202
             
             # Call 3: Rate Limited (429)
             res3 = client.post("/projects/proj-123/pull-requests/10/review")
@@ -120,8 +117,6 @@ def test_review_endpoint_enforces_rate_limit():
             assert "Rate limit exceeded" in res3.text
     finally:
         app.dependency_overrides.pop(get_current_user, None)
-        review_rate_limiter.max_requests = original_limit
-        review_rate_limiter.reset("test-rate-user")
 
 # ----------------------------------------------------
 # 3. PYDANTIC LENGTH BOUNDS TESTS

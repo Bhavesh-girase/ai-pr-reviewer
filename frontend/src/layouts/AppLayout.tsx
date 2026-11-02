@@ -95,7 +95,7 @@ export default function AppLayout() {
                     <div className="h-8 w-8 rounded-lg bg-white flex items-center justify-center shadow-md">
                       <Terminal className="h-4.5 w-4.5 text-zinc-950" />
                     </div>
-                    <span className="font-bold text-white text-sm">AI PR Reviewer</span>
+                    <span className="font-bold text-white text-sm">RepoVela</span>
                   </div>
                   <button
                     onClick={() => setIsMobileOpen(false)}
@@ -169,7 +169,7 @@ export default function AppLayout() {
           {/* Portfolio tech stack footer */}
           <footer className="mt-8 pt-4 border-t border-border/40 text-center select-none shrink-0">
             <span className="text-[9px] font-mono text-zinc-600 tracking-widest uppercase">
-              Gemini 2.5 Flash • Hybrid Search • CrossEncoder Reranker • FastAPI • ChromaDB
+              AI • Hybrid Search • CrossEncoder Reranker • FastAPI • ChromaDB
             </span>
           </footer>
         </main>

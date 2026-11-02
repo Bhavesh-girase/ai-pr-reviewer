@@ -1,9 +1,11 @@
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from src.services.insights_service import InsightsService
+from src.services.insights_service import INSIGHTS_PAGE_SIZE, InsightsService, _iter_project_rows
+from src.schemas.insights import InsightsResponseSchema
 
 @pytest.fixture
 def mock_project_data():
@@ -116,13 +118,20 @@ def test_get_project_insights_aggregation(mock_project_data, mock_prs, mock_revi
                 t_mock.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[mock_project_data])
             elif table_name == "pull_requests":
                 query = MagicMock()
+                query.eq.return_value = query
                 query.gte.return_value = query
-                query.order.return_value.execute.return_value = MagicMock(data=mock_prs)
+                query.in_.return_value = query
+                query.order.return_value = query
+                query.range.return_value = query
+                query.execute.return_value = MagicMock(data=mock_prs)
                 t_mock.select.return_value.eq.return_value = query
             elif table_name == "reviews":
                 query = MagicMock()
+                query.eq.return_value = query
                 query.gte.return_value = query
-                query.order.return_value.execute.return_value = MagicMock(data=mock_reviews)
+                query.order.return_value = query
+                query.range.return_value = query
+                query.execute.return_value = MagicMock(data=mock_reviews)
                 t_mock.select.return_value.eq.return_value = query
             return t_mock
 
@@ -138,6 +147,7 @@ def test_get_project_insights_aggregation(mock_project_data, mock_prs, mock_revi
 
             assert insights["project_id"] == "proj-uuid-123"
             assert insights["date_range"] == "30d"
+            InsightsResponseSchema.model_validate(insights)
             assert insights["overview"]["total_pull_requests"] == 2
             assert insights["overview"]["merged_pull_requests"] == 1
             assert insights["overview"]["open_pull_requests"] == 1
@@ -179,13 +189,20 @@ def test_empty_project_insights(mock_project_data):
                 t_mock.select.return_value.eq.return_value.execute.return_value = MagicMock(data=[mock_project_data])
             elif table_name == "pull_requests":
                 query = MagicMock()
+                query.eq.return_value = query
                 query.gte.return_value = query
-                query.order.return_value.execute.return_value = MagicMock(data=[])
+                query.in_.return_value = query
+                query.order.return_value = query
+                query.range.return_value = query
+                query.execute.return_value = MagicMock(data=[])
                 t_mock.select.return_value.eq.return_value = query
             elif table_name == "reviews":
                 query = MagicMock()
+                query.eq.return_value = query
                 query.gte.return_value = query
-                query.order.return_value.execute.return_value = MagicMock(data=[])
+                query.order.return_value = query
+                query.range.return_value = query
+                query.execute.return_value = MagicMock(data=[])
                 t_mock.select.return_value.eq.return_value = query
             return t_mock
 
@@ -227,3 +244,34 @@ def test_unauthorized_insights_access_rejected(mock_project_data):
             assert exc.value.status_code == 403
 
     asyncio.run(run())
+
+
+def test_insights_iterator_reads_beyond_postgrest_default_row_limit():
+    rows = [{"id": f"review-{index}"} for index in range(INSIGHTS_PAGE_SIZE * 2 + 1)]
+    query = MagicMock()
+    query.eq.return_value = query
+    query.order.return_value = query
+
+    def set_page_range(start, end):
+        query.execute.return_value = SimpleNamespace(data=rows[start:end + 1])
+        return query
+
+    query.range.side_effect = set_page_range
+    supabase = MagicMock()
+    supabase.table.return_value.select.return_value = query
+
+    result_rows = list(_iter_project_rows(
+        supabase=supabase,
+        table_name="reviews",
+        columns="id",
+        project_id="project-1",
+        cutoff_iso=None,
+        order_by="created_at",
+    ))
+
+    assert len(result_rows) == len(rows)
+    assert [call.args for call in query.range.call_args_list] == [
+        (0, INSIGHTS_PAGE_SIZE - 1),
+        (INSIGHTS_PAGE_SIZE, INSIGHTS_PAGE_SIZE * 2 - 1),
+        (INSIGHTS_PAGE_SIZE * 2, INSIGHTS_PAGE_SIZE * 3 - 1),
+    ]

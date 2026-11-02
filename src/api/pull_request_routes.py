@@ -1,6 +1,7 @@
 import logging
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, Depends, Query, status, HTTPException
+from starlette.concurrency import run_in_threadpool
 from src.api.auth import get_current_user
 from src.schemas.pull_request import (
     PullRequestListResponseSchema,
@@ -9,6 +10,7 @@ from src.schemas.pull_request import (
     PullRequestDiffSchema,
     PullRequestReviewRequestSchema,
 )
+from src.schemas.review import ReviewQueueResponseSchema
 from src.security.rate_limiter import review_rate_limiter
 from src.services.pull_request_service import pull_request_service
 
@@ -31,7 +33,8 @@ async def list_pull_requests(
     Fetches real-time Pull Requests for the project's GitHub repository.
     Strictly verifies project existence and multi-user ownership.
     """
-    return pull_request_service.get_pull_requests(
+    return await run_in_threadpool(
+        pull_request_service.get_pull_requests,
         project_id=project_id,
         user_id=current_user["id"],
         user_token=current_user["token"],
@@ -52,7 +55,8 @@ async def get_pull_request(
     """
     Retrieves full metadata for a specific Pull Request from GitHub.
     """
-    return pull_request_service.get_pull_request(
+    return await run_in_threadpool(
+        pull_request_service.get_pull_request,
         project_id=project_id,
         pr_number=pr_number,
         user_id=current_user["id"],
@@ -68,7 +72,8 @@ async def get_pull_request_files(
     """
     Retrieves changed files, additions/deletions counts, and diff patches for a Pull Request.
     """
-    return pull_request_service.get_pull_request_files(
+    return await run_in_threadpool(
+        pull_request_service.get_pull_request_files,
         project_id=project_id,
         pr_number=pr_number,
         user_id=current_user["id"],
@@ -84,14 +89,19 @@ async def get_pull_request_diff(
     """
     Retrieves the raw unified PR diff from GitHub.
     """
-    return pull_request_service.get_pull_request_diff(
+    return await run_in_threadpool(
+        pull_request_service.get_pull_request_diff,
         project_id=project_id,
         pr_number=pr_number,
         user_id=current_user["id"],
         user_token=current_user["token"],
     )
 
-@router.post("/{pr_number}/review")
+@router.post(
+    "/{pr_number}/review",
+    response_model=ReviewQueueResponseSchema,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 async def review_pull_request(
     project_id: str,
     pr_number: int,
@@ -99,12 +109,15 @@ async def review_pull_request(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    Executes the existing AI Review Pipeline for the specified Project Pull Request.
-    Does not require the user to provide a repository URL manually.
-    Rate limited per authenticated user prior to expensive RAG/LLM processing.
+    Enqueues an AI review for the specified Project Pull Request.
+    Rate limited per authenticated user before the job is added to the shared queue.
     """
     user_id = current_user["id"]
-    review_rate_limiter.check_rate_limit(user_id)
+    await run_in_threadpool(
+        review_rate_limiter.check_rate_limit,
+        user_id,
+        current_user["token"],
+    )
 
     return await pull_request_service.review_pull_request(
         project_id=project_id,

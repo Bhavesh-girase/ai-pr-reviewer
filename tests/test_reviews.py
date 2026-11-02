@@ -4,6 +4,7 @@ import pytest
 from fastapi import HTTPException
 
 from src.services.review_service import ReviewService
+from src.review.schemas import ReviewIssue, Severity
 from src.utils.security import encryption_service
 
 @pytest.fixture
@@ -71,6 +72,15 @@ def mock_ai_review_output():
                             "line": 15
                         },
                         {
+                            "severity": "CRITICAL",
+                            "category": "Security",
+                            "title": "Authentication bypass",
+                            "description": "Unauthenticated callers can reach an administrative operation.",
+                            "suggestion": "Require and verify the appropriate authorization before execution.",
+                            "file": "src/api.py",
+                            "line": 18
+                        },
+                        {
                             "severity": "LOW",
                             "category": "Style",
                             "title": "Trailing whitespace",
@@ -127,6 +137,20 @@ def test_connected_account_credential_id_resolution(mock_project_data, mock_cred
         assert token == "pat_test_123"
         assert "github_credentials" in accessed_tables
         assert "github_accounts" not in accessed_tables
+
+
+def test_review_issue_schema_accepts_critical_severity():
+    issue = ReviewIssue(
+        severity="CRITICAL",
+        category="Security",
+        title="Authentication bypass",
+        description="Unauthenticated callers can access an administrative operation.",
+        suggestion="Enforce authorization before the operation.",
+        file="src/api.py",
+        line=18,
+    )
+
+    assert issue.severity is Severity.CRITICAL
 
 
 def test_fallback_credential_resolution_by_user_id(mock_project_data, mock_credential_data):
@@ -331,11 +355,13 @@ def test_create_and_execute_review_lifecycle_and_persistence(
             assert review_call_kwargs["repository"] == "test-repo"
             assert review_call_kwargs["pull_number"] == 42
             assert "local_path" in review_call_kwargs
+            assert "chroma_path" in review_call_kwargs
 
             # 9 & 11: Successful review -> COMPLETED with review_result persisted
             assert result["id"] == "rev-uuid-001"
             assert result["status"] == "COMPLETED"
-            assert result["issues_count"] == 2
+            assert result["issues_count"] == 3
+            assert result["critical_count"] == 1
             assert result["high_count"] == 1
             assert result["low_count"] == 1
             assert result["files_reviewed"] == 1
@@ -345,7 +371,15 @@ def test_create_and_execute_review_lifecycle_and_persistence(
 
             assert len(review_updated) == 1
             assert review_updated[0]["status"] == "COMPLETED"
+            assert review_updated[0]["critical_count"] == 1
             assert "reviews" in review_updated[0]["review_result"]
+            stored_file_review = review_updated[0]["review_result"]["reviews"][0]
+            assert stored_file_review["patch"] == ""
+            assert stored_file_review["original_code"] == ""
+            assert stored_file_review["modified_code"] == ""
+            assert stored_file_review["retrieved_context"] == []
+            # The manual review response still has its existing payload shape/data.
+            assert result["review_result"]["reviews"][0]["original_code"] == "def old(): pass"
 
             # 12: No use of nonexistent github_accounts
             assert "github_accounts" not in table_calls
@@ -430,7 +464,8 @@ def test_get_review_by_id_maps_author_username_and_github_url(mock_project_data,
             "status": "COMPLETED",
             "summary": "Clean code",
             "review_result": mock_ai_review_output,
-            "issues_count": 2,
+            "issues_count": 3,
+            "critical_count": 1,
             "high_count": 1,
             "created_at": "2026-08-26T22:00:00Z"
         }

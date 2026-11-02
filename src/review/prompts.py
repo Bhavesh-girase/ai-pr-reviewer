@@ -88,8 +88,15 @@ Severity:
 Explanation:
 Suggestion:
 
+Use this severity rubric consistently and reserve CRITICAL for exceptional cases:
+- CRITICAL: A directly supported, readily exploitable flaw with severe, broad impact, such as remote code execution, authentication/authorization bypass, exposed high-value secrets, catastrophic data loss, or a system-wide outage. It must require immediate remediation; do not use CRITICAL for hypothetical risks or ordinary bugs.
+- HIGH: A concrete security, correctness, or reliability defect with significant impact, but narrower scope, stronger preconditions, or a practical workaround than CRITICAL.
+- MEDIUM: A real issue with moderate impact, limited scope, or nontrivial preconditions.
+- LOW: A minor, localized issue with limited impact, such as a small maintainability or usability concern.
+
+Choose the lowest severity that accurately represents the demonstrated impact. Never raise severity merely because an issue is security-related.
+
 Do not invent issues.
 Only review what is supported by the provided context.
 """
 )
-    

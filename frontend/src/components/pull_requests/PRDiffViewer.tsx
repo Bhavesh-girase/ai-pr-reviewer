@@ -9,6 +9,8 @@ import {
   Loader2,
   Copy,
   Check,
+  PanelLeftClose,
+  PanelLeftOpen,
 } from 'lucide-react'
 
 interface PRDiffViewerProps {
@@ -17,6 +19,8 @@ interface PRDiffViewerProps {
   isLoading?: boolean
   issueLines?: number[]
   focusLine?: number | null
+  isFilePanelOpen: boolean
+  onToggleFilePanel: () => void
 }
 
 const getLanguageFromFilename = (filename: string): string => {
@@ -89,6 +93,8 @@ export const PRDiffViewer: React.FC<PRDiffViewerProps> = ({
   isLoading = false,
   issueLines = [],
   focusLine = null,
+  isFilePanelOpen,
+  onToggleFilePanel,
 }) => {
   // Tabs: 'diff' (unified patch diff) | 'split' (side-by-side diff) | 'after' (head version) | 'before' (base version)
   const [activeViewTab, setActiveViewTab] = useState<'diff' | 'split' | 'after' | 'before'>('diff')
@@ -167,11 +173,17 @@ export const PRDiffViewer: React.FC<PRDiffViewerProps> = ({
   const handleEditorMount = (editor: any, monaco: Monaco) => {
     editorRef.current = editor
     monacoRef.current = monaco
+    requestAnimationFrame(() => {
+      if (editor.getDomNode()?.isConnected) editor.layout()
+    })
   }
 
   const handleDiffEditorMount = (editor: any, monaco: Monaco) => {
     editorRef.current = editor.getModifiedEditor()
     monacoRef.current = monaco
+    requestAnimationFrame(() => {
+      if (editor.getDomNode()?.isConnected) editor.layout()
+    })
   }
 
   const handleCopyDiff = () => {
@@ -184,6 +196,7 @@ export const PRDiffViewer: React.FC<PRDiffViewerProps> = ({
   const monacoOptions = {
     readOnly: true,
     domReadOnly: true,
+    automaticLayout: true,
     minimap: { enabled: false },
     scrollBeyondLastLine: false,
     fontSize: 12.5,
@@ -273,6 +286,19 @@ export const PRDiffViewer: React.FC<PRDiffViewerProps> = ({
 
         {/* Right: View Mode Tabs & Copy Button */}
         <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={onToggleFilePanel}
+            title={isFilePanelOpen ? 'Hide changed files' : 'Show changed files'}
+            aria-label={isFilePanelOpen ? 'Hide changed files panel' : 'Show changed files panel'}
+            aria-expanded={isFilePanelOpen}
+            aria-controls="pr-changed-files-panel"
+            className="inline-flex items-center gap-1.5 rounded-md border border-zinc-800 bg-zinc-900 px-2 py-1.5 text-[11px] font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-white"
+          >
+            {isFilePanelOpen ? <PanelLeftClose className="h-3.5 w-3.5" /> : <PanelLeftOpen className="h-3.5 w-3.5" />}
+            <span className="hidden sm:inline">{isFilePanelOpen ? 'Hide files' : 'Show files'}</span>
+          </button>
+
           <div className="flex items-center bg-zinc-900 border border-zinc-800 rounded-lg p-0.5 text-xs">
             <button
               onClick={() => setActiveViewTab('diff')}
@@ -335,7 +361,7 @@ export const PRDiffViewer: React.FC<PRDiffViewerProps> = ({
       </div>
 
       {/* Editor Content Area */}
-      <div className="flex-1 relative min-h-[480px] bg-[#09090b]">
+      <div className="relative h-[520px] shrink-0 bg-[#09090b]">
         {!hasPatch && !rawDiff ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center space-y-3">
             <AlertCircle className="h-8 w-8 text-amber-500" />
@@ -346,7 +372,8 @@ export const PRDiffViewer: React.FC<PRDiffViewerProps> = ({
           </div>
         ) : activeViewTab === 'split' ? (
           <DiffEditor
-            height="100%"
+            height="520px"
+            className="h-full"
             original={baseCode}
             modified={headCode}
             language={getLanguageFromFilename(filename)}
@@ -362,7 +389,8 @@ export const PRDiffViewer: React.FC<PRDiffViewerProps> = ({
           />
         ) : activeViewTab === 'diff' ? (
           <Editor
-            height="100%"
+            height="520px"
+            className="h-full"
             value={patch || rawDiff || ''}
             language="diff"
             theme="vs-dark"
@@ -377,7 +405,8 @@ export const PRDiffViewer: React.FC<PRDiffViewerProps> = ({
           />
         ) : activeViewTab === 'after' ? (
           <Editor
-            height="100%"
+            height="520px"
+            className="h-full"
             value={headCode}
             language={getLanguageFromFilename(filename)}
             theme="vs-dark"
@@ -386,7 +415,8 @@ export const PRDiffViewer: React.FC<PRDiffViewerProps> = ({
           />
         ) : (
           <Editor
-            height="100%"
+            height="520px"
+            className="h-full"
             value={baseCode}
             language={getLanguageFromFilename(filename)}
             theme="vs-dark"

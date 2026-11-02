@@ -1,4 +1,4 @@
-import { Cpu, CheckCircle2, Sparkles, Layers, Search, Database } from 'lucide-react'
+import { Cpu, CheckCircle2, Bot, Layers, Search, Database } from 'lucide-react'
 
 export default function AIEngineCard() {
   return (
@@ -17,10 +17,10 @@ export default function AIEngineCard() {
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
         <div className="space-y-1">
           <span className="text-[10px] uppercase font-bold text-zinc-500 flex items-center gap-1">
-            <Sparkles className="h-3 w-3 text-indigo-400" />
+            <Bot className="h-3 w-3 text-indigo-400" />
             <span>LLM Model</span>
           </span>
-          <p className="text-white font-semibold">Gemini 2.5 Flash</p>
+          <p className="text-white font-semibold">AI</p>
         </div>
 
         <div className="space-y-1">
@@ -28,7 +28,7 @@ export default function AIEngineCard() {
             <Layers className="h-3 w-3 text-emerald-400" />
             <span>Embedding Model</span>
           </span>
-          <p className="text-white font-semibold">Gemini Text Embeddings</p>
+          <p className="text-white font-semibold">AI Embeddings</p>
         </div>
 
         <div className="space-y-1">

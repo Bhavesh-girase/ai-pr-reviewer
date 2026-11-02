@@ -1,9 +1,9 @@
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 from fastapi import APIRouter, Depends, Query, status
 
 from src.api.auth import get_current_user
-from src.schemas.insights import InsightsResponseSchema
+from src.schemas.insights import DateRangeEnum, InsightsResponseSchema
 from src.services.insights_service import insights_service
 
 logger = logging.getLogger("insights_routes")
@@ -17,7 +17,7 @@ router = APIRouter(tags=["Insights"])
 )
 async def get_project_insights(
     project_id: str,
-    range: Optional[str] = Query("30d", description="Date filter range (7d, 30d, 90d, all)"),
+    range: DateRangeEnum = Query(DateRangeEnum.THIRTY_DAYS, description="Date filter range (7d, 30d, 90d, all)"),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
@@ -28,5 +28,5 @@ async def get_project_insights(
         project_id=project_id,
         user_id=current_user["id"],
         user_token=current_user["token"],
-        range_str=range or "30d",
+        range_str=range.value,
     )

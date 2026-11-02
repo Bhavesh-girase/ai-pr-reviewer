@@ -5,11 +5,9 @@ from src.config import embedding_function
 from src.ingestion.data_utils import get_chroma_directory
 
 
-def load_vectorstore(repository_name: str):
+def load_vectorstore(repository_name: str, persist_directory=None):
     return Chroma(
-        persist_directory=str(
-            get_chroma_directory(repository_name)
-        ),
+        persist_directory=str(persist_directory or get_chroma_directory(repository_name)),
         embedding_function=embedding_function
     )
 

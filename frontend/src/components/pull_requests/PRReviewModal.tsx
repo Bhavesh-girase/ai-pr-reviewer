@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState } from 'react'
 import type { ReviewResponse, ReviewIssue } from '@/types/review'
 import {
   Sparkles,
@@ -21,19 +21,11 @@ interface PRReviewModalProps {
   prTitle: string
   isLoading: boolean
   reviewData: ReviewResponse | null
+  jobStatus?: 'QUEUED' | 'RUNNING'
   error: Error | null
   onStartReview: () => void
   onSelectIssueLine?: (filename: string, line: number) => void
 }
-
-const REVIEW_STEPS = [
-  { id: 1, label: 'Fetching Pull Request', desc: 'Reading GitHub diff & changed commit tree' },
-  { id: 2, label: 'Analyzing Changes', desc: 'Extracting semantic code hunks and syntax AST' },
-  { id: 3, label: 'Retrieving Repository Context', desc: 'Executing Hybrid Search (BM25 + ChromaDB)' },
-  { id: 4, label: 'Reranking Context', desc: 'Scoring chunks with CrossEncoder reranker' },
-  { id: 5, label: 'Generating AI Review', desc: 'Gemini reasoning across codebase context' },
-  { id: 6, label: 'Finalizing Review', desc: 'Formatting issues and actionable suggestions' },
-]
 
 export const PRReviewModal: React.FC<PRReviewModalProps> = ({
   isOpen,
@@ -42,30 +34,12 @@ export const PRReviewModal: React.FC<PRReviewModalProps> = ({
   prTitle,
   isLoading,
   reviewData,
+  jobStatus,
   error,
   onStartReview,
   onSelectIssueLine,
 }) => {
-  const [currentStep, setCurrentStep] = useState(1)
   const [selectedFileFilter, setSelectedFileFilter] = useState<string>('all')
-
-  // Simulate stepped progression during review execution
-  useEffect(() => {
-    if (!isLoading) {
-      if (reviewData) setCurrentStep(6)
-      return
-    }
-
-    setCurrentStep(1)
-    const timers = [
-      setTimeout(() => setCurrentStep(2), 1500),
-      setTimeout(() => setCurrentStep(3), 3500),
-      setTimeout(() => setCurrentStep(4), 6000),
-      setTimeout(() => setCurrentStep(5), 9000),
-    ]
-
-    return () => timers.forEach(clearTimeout)
-  }, [isLoading, reviewData])
 
   if (!isOpen) return null
 
@@ -81,6 +55,7 @@ export const PRReviewModal: React.FC<PRReviewModalProps> = ({
     })
   }
 
+  const criticalSeverityCount = allIssues.filter((i) => i.issue.severity === 'CRITICAL').length
   const highSeverityCount = allIssues.filter((i) => i.issue.severity === 'HIGH').length
   const mediumSeverityCount = allIssues.filter((i) => i.issue.severity === 'MEDIUM').length
   const lowSeverityCount = allIssues.filter((i) => i.issue.severity === 'LOW').length
@@ -105,7 +80,7 @@ export const PRReviewModal: React.FC<PRReviewModalProps> = ({
                 <h3 className="text-sm font-bold text-white truncate max-w-md">{prTitle}</h3>
               </div>
               <p className="text-xs text-zinc-400 mt-0.5">
-                AI Pull Request Review Engine (Hybrid RAG + Gemini 2.5 Flash)
+                AI Pull Request Review Engine (Hybrid RAG)
               </p>
             </div>
           </div>
@@ -150,54 +125,25 @@ export const PRReviewModal: React.FC<PRReviewModalProps> = ({
             </div>
           )}
 
-          {/* Loading State with 6 Progress Stages */}
+          {/* Queue / worker state */}
           {isLoading && (
-            <div className="py-6 space-y-6 max-w-xl mx-auto">
-              <div className="text-center space-y-2">
+            <div className="py-12 space-y-4 max-w-xl mx-auto text-center">
+              <div className="space-y-2">
                 <Loader2 className="h-8 w-8 text-indigo-400 animate-spin mx-auto" />
-                <h4 className="text-sm font-bold text-white">Analyzing Pull Request #{prNumber}</h4>
-                <p className="text-xs text-zinc-400">
-                  Please wait while the AI review pipeline processes the code changes...
+                <h4 className="text-sm font-bold text-white">
+                  {jobStatus === 'QUEUED'
+                    ? 'Review queued'
+                    : jobStatus === 'RUNNING'
+                    ? `Analyzing Pull Request #${prNumber}`
+                    : 'Submitting review request'}
+                </h4>
+                <p className="text-xs text-zinc-400 leading-relaxed">
+                  {jobStatus === 'QUEUED'
+                    ? 'Your review is waiting for an available worker and will start automatically.'
+                    : jobStatus === 'RUNNING'
+                    ? 'A review worker is processing the code changes. This view will update automatically.'
+                    : 'Adding your review to the shared queue…'}
                 </p>
-              </div>
-
-              {/* Progress Steps */}
-              <div className="space-y-2.5 bg-zinc-900/50 border border-zinc-850 p-4 rounded-xl">
-                {REVIEW_STEPS.map((step) => {
-                  const isDone = currentStep > step.id
-                  const isCurrent = currentStep === step.id
-                  return (
-                    <div
-                      key={step.id}
-                      className={`flex items-start gap-3 p-2.5 rounded-lg text-xs transition-all ${
-                        isCurrent
-                          ? 'bg-indigo-950/40 border border-indigo-500/30 text-white'
-                          : isDone
-                          ? 'text-zinc-400'
-                          : 'text-zinc-600 opacity-60'
-                      }`}
-                    >
-                      <div className="mt-0.5 shrink-0">
-                        {isDone ? (
-                          <CheckCircle2 className="h-4 w-4 text-emerald-400" />
-                        ) : isCurrent ? (
-                          <Loader2 className="h-4 w-4 text-indigo-400 animate-spin" />
-                        ) : (
-                          <div className="h-4 w-4 rounded-full border border-zinc-700 text-[10px] flex items-center justify-center font-mono">
-                            {step.id}
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex-1">
-                        <div className="font-semibold flex items-center justify-between">
-                          <span>{step.label}</span>
-                          {isCurrent && <span className="text-[10px] text-indigo-400 font-mono">Active</span>}
-                        </div>
-                        <p className="text-[11px] text-zinc-400 mt-0.5">{step.desc}</p>
-                      </div>
-                    </div>
-                  )
-                })}
               </div>
             </div>
           )}
@@ -260,6 +206,8 @@ export const PRReviewModal: React.FC<PRReviewModalProps> = ({
                     <span>Issues Found</span>
                   </span>
                   <div className="flex items-center gap-1.5 text-xs font-mono font-bold">
+                    <span className="text-red-300">{criticalSeverityCount}C</span>
+                    <span className="text-zinc-600">/</span>
                     <span className="text-red-400">{highSeverityCount}H</span>
                     <span className="text-zinc-600">/</span>
                     <span className="text-amber-400">{mediumSeverityCount}M</span>
@@ -318,6 +266,7 @@ export const PRReviewModal: React.FC<PRReviewModalProps> = ({
                   <div className="space-y-3">
                     {filteredIssues.map((item, index) => {
                       const { filename, issue } = item
+                      const isCritical = issue.severity === 'CRITICAL'
                       const isHigh = issue.severity === 'HIGH'
                       const isMedium = issue.severity === 'MEDIUM'
 
@@ -325,7 +274,9 @@ export const PRReviewModal: React.FC<PRReviewModalProps> = ({
                         <div
                           key={index}
                           className={`rounded-xl border p-4 text-xs space-y-2.5 transition-all ${
-                            isHigh
+                            isCritical
+                              ? 'border-red-700/70 bg-red-950/30'
+                              : isHigh
                               ? 'border-red-900/50 bg-red-950/10'
                               : isMedium
                               ? 'border-amber-900/50 bg-amber-950/10'
@@ -338,7 +289,9 @@ export const PRReviewModal: React.FC<PRReviewModalProps> = ({
                               <div className="flex items-center gap-2 flex-wrap">
                                 <span
                                   className={`px-2 py-0.5 rounded text-[10px] font-bold font-mono ${
-                                    isHigh
+                                    isCritical
+                                      ? 'bg-red-500/30 text-red-200 border border-red-400/50'
+                                      : isHigh
                                       ? 'bg-red-500/20 text-red-400 border border-red-500/30'
                                       : isMedium
                                       ? 'bg-amber-500/20 text-amber-400 border border-amber-500/30'
@@ -400,7 +353,11 @@ export const PRReviewModal: React.FC<PRReviewModalProps> = ({
         {/* Modal Footer */}
         <div className="flex items-center justify-between px-6 py-3 border-t border-zinc-900 bg-zinc-950">
           <span className="text-[11px] text-zinc-500">
-            {reviewData ? 'Review complete.' : 'AI review execution will not modify any files.'}
+            {reviewData
+              ? 'Review complete.'
+              : jobStatus === 'QUEUED'
+              ? 'Queued reviews run automatically when a worker is available.'
+              : 'AI review execution will not modify any files.'}
           </span>
           <div className="flex items-center gap-2">
             {reviewData && (

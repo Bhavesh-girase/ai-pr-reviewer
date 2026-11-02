@@ -4,14 +4,22 @@ from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 from fastapi import HTTPException, status
+from starlette.concurrency import run_in_threadpool
 
 from src.api.auth import get_supabase_client
 from src.pr_reviewer import PRReviewer
 from src.services.pull_request_sync_service import pull_request_sync_service
+from src.services.github_credentials_service import github_credentials_service
 from src.storage.project_storage import project_storage
 from src.utils.security import encryption_service, sanitize_error_message
 
 logger = logging.getLogger("review_service")
+
+
+async def _execute(query):
+    """Execute a synchronous Supabase/PostgREST query outside the event loop."""
+    return await run_in_threadpool(query.execute)
+
 
 class ReviewService:
     """
@@ -23,7 +31,7 @@ class ReviewService:
         self,
         project_id: str,
         user_id: str,
-        user_token: str
+        user_token: Optional[str]
     ) -> tuple[Dict[str, Any], str]:
         supabase = get_supabase_client(user_token)
         proj_res = supabase.table("projects").select("*").eq("id", project_id).execute()
@@ -40,20 +48,11 @@ class ReviewService:
                 detail="You do not have permission to access reviews for this project."
             )
 
-        auth_type = project.get("auth_type", "connected_account")
+        auth_type = github_credentials_service.get_project_auth_type(project)
         token: Optional[str] = None
 
         if auth_type == "custom_token":
-            encrypted_token = project.get("custom_token")
-            if encrypted_token:
-                try:
-                    token = encryption_service.decrypt_or_passthrough(encrypted_token)
-                except Exception as e:
-                    logger.error(f"Failed to decrypt custom token for project {project_id}: {sanitize_error_message(e)}")
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Failed to decrypt project credentials."
-                    )
+            token = github_credentials_service.resolve_custom_token(project)
         else:
             # connected_account
             github_credential_id = project.get("github_credential_id")
@@ -121,18 +120,104 @@ class ReviewService:
 
         return project, token
 
+    async def enqueue_review(
+        self,
+        project_id: str,
+        pr_number: int,
+        user_id: str,
+        user_token: str,
+    ) -> Dict[str, Any]:
+        """Validate a review request and persist it as a queued job."""
+        supabase = await run_in_threadpool(get_supabase_client, user_token)
+        project, _token = await run_in_threadpool(
+            self._resolve_project_and_token,
+            project_id,
+            user_id,
+            user_token,
+        )
+
+        pr_query = (
+            supabase.table("pull_requests")
+            .select("*")
+            .eq("project_id", project_id)
+            .eq("github_pr_number", pr_number)
+        )
+        pr_query_result = await _execute(pr_query)
+        pr_record = pr_query_result.data[0] if pr_query_result.data else None
+
+        if not pr_record:
+            try:
+                pr_record = await run_in_threadpool(
+                    pull_request_sync_service.sync_single_pull_request,
+                    project_id=project_id,
+                    pr_number=pr_number,
+                    user_id=user_id,
+                    user_token=user_token,
+                )
+            except Exception as exc:
+                logger.warning("Could not pre-sync PR #%s: %s", pr_number, exc)
+
+        if not pr_record:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Pull Request #{pr_number} not found for project '{project_id}'.",
+            )
+
+        now_queued = datetime.now(timezone.utc).isoformat()
+        queued_review = {
+            "project_id": project_id,
+            "pull_request_id": pr_record["id"],
+            "github_pr_number": pr_number,
+            "status": "QUEUED",
+            "model_name": "Gemini 2.5 Flash",
+            "base_commit_sha": pr_record.get("base_commit_sha") or pr_record.get("base_sha") or "unknown",
+            "head_commit_sha": pr_record.get("head_commit_sha") or pr_record.get("head_sha") or "unknown",
+            "created_by": user_id,
+            "created_at": now_queued,
+        }
+        insert_res = await _execute(supabase.table("reviews").insert(queued_review))
+        if not insert_res.data:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to enqueue AI review.",
+            )
+
+        review_id = insert_res.data[0]["id"]
+        logger.info("Queued Review %s for PR #%s on Project %s", review_id, pr_number, project_id)
+        return {"review_id": review_id, "status": "QUEUED", "created_at": now_queued}
+
     async def create_and_execute_review(
         self,
         project_id: str,
         pr_number: int,
         user_id: str,
-        user_token: str
+        user_token: Optional[str],
+        review_id: Optional[str] = None,
+        worker_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes an AI review for a Pull Request and persists the immutable Review record.
         """
-        supabase = get_supabase_client(user_token)
-        project, token = self._resolve_project_and_token(project_id, user_id, user_token)
+        supabase = await run_in_threadpool(get_supabase_client, user_token)
+        now_started: Optional[str] = None
+        if review_id is not None:
+            claimed_res = await _execute(
+                supabase.table("reviews")
+                .select("id, created_at, status, worker_id")
+                .eq("id", review_id)
+                .eq("status", "RUNNING")
+                .eq("worker_id", worker_id)
+            )
+            if not claimed_res.data:
+                raise RuntimeError(f"Review job {review_id} is no longer owned by worker {worker_id}")
+            now_started = claimed_res.data[0].get("created_at") or datetime.now(timezone.utc).isoformat()
+
+        project, token = await run_in_threadpool(
+            self._resolve_project_and_token,
+            project_id,
+            user_id,
+            user_token,
+        )
 
         owner = project["github_owner"]
         repo = project["github_repository"]
@@ -144,20 +229,21 @@ class ReviewService:
             .select("*")
             .eq("project_id", project_id)
             .eq("github_pr_number", pr_number)
-            .execute()
         )
+        pr_query_result = await _execute(pr_query)
 
         pr_record = None
-        if pr_query.data:
-            pr_record = pr_query.data[0]
+        if pr_query_result.data:
+            pr_record = pr_query_result.data[0]
         else:
             # Sync single PR from GitHub if not yet cached in DB
             try:
-                pr_record = pull_request_sync_service.sync_single_pull_request(
+                pr_record = await run_in_threadpool(
+                    pull_request_sync_service.sync_single_pull_request,
                     project_id=project_id,
                     pr_number=pr_number,
                     user_id=user_id,
-                    user_token=user_token
+                    user_token=user_token,
                 )
             except Exception as e:
                 logger.warning(f"Could not pre-sync PR #{pr_number}: {e}")
@@ -171,43 +257,50 @@ class ReviewService:
         base_sha = pr_record.get("base_commit_sha") or pr_record.get("base_sha") or "unknown"
         head_sha = pr_record.get("head_commit_sha") or pr_record.get("head_sha") or "unknown"
 
-        # 2. Insert initial Review record with status 'RUNNING'
-        now_started = datetime.now(timezone.utc).isoformat()
-        new_review = {
-            "project_id": project_id,
-            "pull_request_id": pr_record["id"],
-            "github_pr_number": pr_number,
-            "status": "RUNNING",
-            "model_name": "Gemini 2.5 Flash",
-            "base_commit_sha": base_sha,
-            "head_commit_sha": head_sha,
-            "created_by": user_id,
-            "created_at": now_started,
-        }
-
-        insert_res = supabase.table("reviews").insert(new_review).execute()
-        if not insert_res.data:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to initialize review record in database."
-            )
-
-        review_id = insert_res.data[0]["id"]
-        logger.info(f"Initialized Review {review_id} (RUNNING) for PR #{pr_number} on Project {project_id}")
+        # Direct callers retain the old synchronous behavior. Queue workers pass
+        # the review row claimed atomically by Postgres and reuse that record.
+        if review_id is None:
+            now_started = datetime.now(timezone.utc).isoformat()
+            new_review = {
+                "project_id": project_id,
+                "pull_request_id": pr_record["id"],
+                "github_pr_number": pr_number,
+                "status": "RUNNING",
+                "model_name": "Gemini 2.5 Flash",
+                "base_commit_sha": base_sha,
+                "head_commit_sha": head_sha,
+                "created_by": user_id,
+                "created_at": now_started,
+            }
+            insert_res = await _execute(supabase.table("reviews").insert(new_review))
+            if not insert_res.data:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Failed to initialize review record in database."
+                )
+            review_id = insert_res.data[0]["id"]
+            logger.info(f"Initialized Review {review_id} (RUNNING) for PR #{pr_number} on Project {project_id}")
 
         # 3. Execute AI Review Pipeline
         start_time = time.time()
         try:
-            repo_dir, _ = project_storage.ensure_project_directories(user_id, project_id)
+            repo_dir, chroma_dir = await run_in_threadpool(
+                project_storage.ensure_project_directories,
+                user_id,
+                project_id,
+            )
             local_repo_path = Path(project.get("clone_path") or str(repo_dir))
+            local_chroma_path = Path(project.get("chroma_path") or str(chroma_dir))
 
             reviewer = PRReviewer(github_token=token)
-            review_data = reviewer.review(
+            review_data = await run_in_threadpool(
+                reviewer.review,
                 repo_url=repo_url,
                 owner=owner,
                 repository=repo,
                 pull_number=pr_number,
-                local_path=local_repo_path
+                local_path=local_repo_path,
+                chroma_path=local_chroma_path,
             )
 
             # 4. Extract structured metadata & calculate severity metrics
@@ -284,13 +377,28 @@ class ReviewService:
                 "reviews": serializable_reviews,
                 "metadata": review_data.get("metadata", {})
             }
+            # Keep historical findings and their API fields, but do not retain
+            # repository source, diffs, or retrieved code context in Postgres.
+            stored_review_payload = {
+                **final_review_payload,
+                "reviews": [
+                    {
+                        **file_review,
+                        "patch": "",
+                        "original_code": "",
+                        "modified_code": "",
+                        "retrieved_context": [],
+                    }
+                    for file_review in serializable_reviews
+                ],
+            }
 
             # 5. Persist COMPLETED review
             now_completed = datetime.now(timezone.utc).isoformat()
             update_data = {
                 "status": "COMPLETED",
                 "summary": summary,
-                "review_result": final_review_payload,
+                "review_result": stored_review_payload,
                 "issues_count": issues_count,
                 "critical_count": critical_count,
                 "high_count": high_count,
@@ -299,10 +407,15 @@ class ReviewService:
                 "files_reviewed": files_reviewed,
                 "review_duration_ms": duration_ms,
                 "completed_at": now_completed,
-                "error_message": None
+                "error_message": None,
+                "worker_id": None,
+                "lease_expires_at": None,
             }
 
-            supabase.table("reviews").update(update_data).eq("id", review_id).execute()
+            update_query = supabase.table("reviews").update(update_data).eq("id", review_id)
+            if worker_id:
+                update_query = update_query.eq("worker_id", worker_id)
+            await _execute(update_query)
 
             logger.info(f"Review {review_id} COMPLETED for PR #{pr_number} ({issues_count} issues found)")
 
@@ -340,11 +453,17 @@ class ReviewService:
             now_failed = datetime.now(timezone.utc).isoformat()
             safe_error = "Unable to complete AI analysis. " + sanitized_err
             try:
-                supabase.table("reviews").update({
+                failed_update = {
                     "status": "FAILED",
                     "error_message": safe_error,
-                    "completed_at": now_failed
-                }).eq("id", review_id).execute()
+                    "completed_at": now_failed,
+                }
+                if worker_id:
+                    failed_update.update({"worker_id": None, "lease_expires_at": None})
+                failed_query = supabase.table("reviews").update(failed_update).eq("id", review_id)
+                if worker_id:
+                    failed_query = failed_query.eq("worker_id", worker_id)
+                await _execute(failed_query)
             except Exception:
                 pass
 
@@ -369,8 +488,13 @@ class ReviewService:
         """
         Lists paginated lightweight reviews belonging to a project.
         """
-        supabase = get_supabase_client(user_token)
-        self._resolve_project_and_token(project_id, user_id, user_token)
+        supabase = await run_in_threadpool(get_supabase_client, user_token)
+        await run_in_threadpool(
+            self._resolve_project_and_token,
+            project_id,
+            user_id,
+            user_token,
+        )
 
         # Build select query (without huge review_result JSON for list performance)
         columns = (
@@ -396,7 +520,7 @@ class ReviewService:
         offset = (page - 1) * per_page
         query = query.range(offset, offset + per_page - 1)
 
-        result = query.execute()
+        result = await _execute(query)
         reviews = result.data or []
         total_count = result.count if result.count is not None else len(reviews)
 
@@ -404,7 +528,9 @@ class ReviewService:
         if reviews:
             pr_ids = list({r["pull_request_id"] for r in reviews if r.get("pull_request_id")})
             if pr_ids:
-                pr_res = supabase.table("pull_requests").select("id, title").in_("id", pr_ids).execute()
+                pr_res = await _execute(
+                    supabase.table("pull_requests").select("id, title").in_("id", pr_ids)
+                )
                 pr_map = {p["id"]: p.get("title") for p in pr_res.data or []}
                 for r in reviews:
                     r["pr_title"] = pr_map.get(r.get("pull_request_id"))
@@ -426,10 +552,17 @@ class ReviewService:
         """
         Retrieves complete review details including full structured review_result JSONB.
         """
-        supabase = get_supabase_client(user_token)
-        self._resolve_project_and_token(project_id, user_id, user_token)
+        supabase = await run_in_threadpool(get_supabase_client, user_token)
+        await run_in_threadpool(
+            self._resolve_project_and_token,
+            project_id,
+            user_id,
+            user_token,
+        )
 
-        res = supabase.table("reviews").select("*").eq("id", review_id).eq("project_id", project_id).execute()
+        res = await _execute(
+            supabase.table("reviews").select("*").eq("id", review_id).eq("project_id", project_id)
+        )
         if not res.data:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
@@ -440,7 +573,9 @@ class ReviewService:
 
         # Attach PR metadata
         if review.get("pull_request_id"):
-            pr_res = supabase.table("pull_requests").select("*").eq("id", review["pull_request_id"]).execute()
+            pr_res = await _execute(
+                supabase.table("pull_requests").select("*").eq("id", review["pull_request_id"])
+            )
             if pr_res.data:
                 pr = pr_res.data[0]
                 review["pr_title"] = pr.get("title")
@@ -461,8 +596,13 @@ class ReviewService:
         """
         Retrieves all historical reviews for a specific Pull Request, sorted newest first.
         """
-        supabase = get_supabase_client(user_token)
-        self._resolve_project_and_token(project_id, user_id, user_token)
+        supabase = await run_in_threadpool(get_supabase_client, user_token)
+        await run_in_threadpool(
+            self._resolve_project_and_token,
+            project_id,
+            user_id,
+            user_token,
+        )
 
         columns = (
             "id, project_id, pull_request_id, github_pr_number, status, summary, "
@@ -476,9 +616,8 @@ class ReviewService:
             .eq("project_id", project_id)
             .eq("github_pr_number", pr_number)
             .order("created_at", desc=True)
-            .execute()
         )
+        res = await _execute(res)
         return res.data or []
 
 review_service = ReviewService()
-

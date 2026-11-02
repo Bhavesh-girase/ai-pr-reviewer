@@ -100,7 +100,7 @@ class LatestPullRequestSummarySchema(BaseModel):
 
 class InsightsResponseSchema(BaseModel):
     project_id: str
-    date_range: str
+    date_range: DateRangeEnum
     overview: InsightsOverviewSchema
     review_activity: List[ReviewActivityPointSchema] = Field(default_factory=list)
     severity_distribution: SeverityDistributionSchema

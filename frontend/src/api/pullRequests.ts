@@ -6,7 +6,6 @@ import type {
   PullRequestDiff,
   PullRequestFilterParams,
 } from '@/types/pullRequest'
-import type { ReviewResponse } from '@/types/review'
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
 
@@ -98,26 +97,6 @@ export async function getPullRequestDiff(
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({ detail: 'Failed to fetch PR diff.' }))
     throw new Error(errorData.detail || 'Failed to fetch PR diff.')
-  }
-
-  return response.json()
-}
-
-export async function reviewProjectPullRequest(
-  projectId: string,
-  prNumber: number,
-  notes?: string
-): Promise<ReviewResponse> {
-  const headers = await getAuthHeader()
-  const response = await fetch(`${API_BASE_URL}/projects/${projectId}/pull-requests/${prNumber}/review`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ notes }),
-  })
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({ detail: 'AI review failed.' }))
-    throw new Error(errorData.detail || 'Failed to execute AI review pipeline.')
   }
 
   return response.json()

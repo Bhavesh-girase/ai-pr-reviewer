@@ -14,6 +14,12 @@ class ReviewStatusEnum(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 
+
+class ReviewQueueResponseSchema(BaseModel):
+    review_id: str
+    status: str
+    created_at: Optional[str] = None
+
 class ReviewResponseSchema(BaseModel):
     id: str
     project_id: str
