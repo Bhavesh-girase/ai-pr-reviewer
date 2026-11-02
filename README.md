@@ -1,8 +1,10 @@
 <div align="center">
 
-# 🤖 AI PR Reviewer
+<img src="frontend/public/favicon.svg" alt="RepoVela logo" width="64" height="64" />
 
-### Repository-aware AI code reviews for GitHub Pull Requests
+# RepoVela
+
+### AI-powered, repository-aware code reviews for GitHub Pull Requests
 
 *Hybrid RAG (BM25 + Vector Search) · Cross-Encoder Reranking · Gemini-powered review generation*
 
@@ -75,7 +77,7 @@
 
 ## 📖 Overview
 
-**AI PR Reviewer** is a full-stack application that helps developers review GitHub Pull Requests using the **changed code**
+**RepoVela** is a full-stack application that helps developers review GitHub Pull Requests using the **changed code**
 *and* **relevant context retrieved from the surrounding repository**. It combines:
 
 | 🔎 Hybrid Retrieval | 🧬 Ensemble | 🎯 Reranking | ✍️ Generation |
@@ -104,7 +106,7 @@ can exceed model context limits, and exposes more source code than a review need
 
 ## 💡 Solution
 
-AI PR Reviewer implements a **repository-aware Retrieval-Augmented Generation (RAG)** workflow. It retrieves relevant code
+RepoVela implements a **repository-aware Retrieval-Augmented Generation (RAG)** workflow. It retrieves relevant code
 chunks for a PR's changed files, combines lexical and semantic search, reranks candidates, and supplies the selected context
 together with the PR diff to Gemini.
 
